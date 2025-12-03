@@ -1,26 +1,38 @@
+use radians::Wrap64;
+use std::io::Write;
 use std::{
-    collections::{BinaryHeap, HashMap, HashSet},
+    collections::{BinaryHeap, HashMap, HashSet, VecDeque},
+    fs::File,
+    io::BufWriter,
     ops::Range,
 };
-
 use uuid::Uuid;
 
 fn main() {
-    let start_state = State {
-        x: 10.0,
-        y: 10.0,
-        z: 5.0,
-        b: 0.0,
-    };
+    let start_state = State::new(-1.0, 0.0, 1.0, 0.0);
+    let mut world = World::new(Discretizer {
+        dx: DXY,
+        dy: DXY,
+        dz: DZ,
+        db: DB,
+    });
+
+    // let start_id = world.insert(start_state);
+    // let successors = world.successors(&start_id);
+    //
+    // println!("{:#?}", world.state(&start_id));
+    // for succ in successors {
+    //     println!("{:#?}", world.state(&succ));
+    // }
 
     let planner = ARAPlanner {
         start_eps: 4.0,
         eps_delta: 0.5,
         suboptimality: 1.0,
         goal_region: StateRegion {
-            x: -500.0..500.0,
-            y: -500.0..500.0,
-            z: -25.0..25.0,
+            x: -0.5..0.5,
+            y: -0.5..0.5,
+            z: -0.25..0.25,
             b: -0.125..0.125,
         },
     };
@@ -29,24 +41,19 @@ fn main() {
     println!("{:#?}", plan);
 
     // TODO: Replace with timing logic.
-    for _ in 0..10 {
+    for _ in 0..1 {
         plan = planner.plan_from(plan.clone());
     }
 }
 
-/// # State Discretization
-/// - x, y use 125m
-/// - z uses 50m
-/// - bearing uses 0.05 rad
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 struct State {
     // TODO: this might be faster if we use a vector
     // TODO: this would also be more extensible as it could hold any number of state components
-    // TODO: BEARINGS NEED TO WRAP
     x: f64,
     y: f64,
     z: f64,
-    b: f64,
+    b: Wrap64,
 }
 
 #[derive(Clone, Debug)]
@@ -60,7 +67,7 @@ struct StateRegion {
 #[derive(Clone, Debug)]
 struct Vertex {
     id: Uuid,
-    state: State,
+    state: AlignedState,
     successors: Option<Vec<Uuid>>,
 }
 
@@ -133,6 +140,7 @@ struct ARAPlan {
     incons_set: HashSet<Uuid>,
     g_vals: HashMap<Uuid, f64>,
     h_vals: HashMap<Uuid, f64>,
+    eps: f64,
 
     start_id: Uuid,
     goal_id: Option<Uuid>,
@@ -141,12 +149,25 @@ struct ARAPlan {
 }
 
 impl State {
+    pub fn new(x: f64, y: f64, z: f64, b: f64) -> Self {
+        State {
+            x,
+            y,
+            z,
+            b: Wrap64::wrap(b),
+        }
+    }
+
     pub fn euclidean_dist_to(&self, other: &State) -> f64 {
         ((self.x - other.x).powf(2.)
             + (self.y - other.y).powf(2.)
             + (self.z - other.z).powf(2.)
-            + (self.b - other.b).powf(2.))
+            + (self.b - other.b).val().powf(2.))
         .sqrt()
+    }
+
+    pub fn bearing(&self) -> f64 {
+        self.b.val()
     }
 }
 
@@ -155,11 +176,20 @@ impl StateRegion {
         self.x.contains(&state.x)
             && self.y.contains(&state.y)
             && self.z.contains(&state.z)
-            && self.b.contains(&state.b)
+            && self.b.contains(&state.bearing())
+    }
+
+    fn center_between(range: &Range<f64>) -> f64 {
+        range.start + (range.end - range.start) / 2.
     }
 
     pub fn center(&self) -> State {
-        todo!()
+        State::new(
+            Self::center_between(&self.x),
+            Self::center_between(&self.y),
+            Self::center_between(&self.z),
+            Self::center_between(&self.b),
+        )
     }
 }
 
@@ -219,24 +249,46 @@ impl Airplane {
     pub fn move_from(&self, state: &State) -> Vec<State> {
         self.motions
             .iter()
-            .map(|ctl| State {
-                x: state.x + ctl.dxy * state.b.cos(),
-                y: state.y + ctl.dxy * state.b.sin(),
-                z: state.z + ctl.dz,
-                b: state.b + ctl.db,
+            .map(|ctl| {
+                State::new(
+                    state.x + ctl.dxy * state.b.cos(),
+                    state.y + ctl.dxy * state.b.sin(),
+                    state.z + ctl.dz,
+                    state.bearing() + ctl.db,
+                )
             })
             .collect()
     }
 }
 
 impl Discretizer {
-    fn discretize(&self, state: &State) -> AlignedState {
+    fn discrete(&self, state: &State) -> AlignedState {
         AlignedState {
             x: (state.x / self.dx).floor() as i64,
             y: (state.y / self.dy).floor() as i64,
             z: (state.z / self.dz).floor() as i64,
-            b: (state.b / self.db).floor() as i64,
+            b: (state.bearing() / self.db).floor() as i64,
         }
+    }
+
+    fn continuous(&self, state: &AlignedState) -> State {
+        // NOTE: I think this is fine because we are guaranteed that aligned states are in
+        // bounds
+        let b = state.b as f64 * self.db;
+        // FIXME: This assertion fails, i think its related to floating point precision with the
+        // many discrete-continuous seesawing.
+        // I got a b value of like -3.15000001.
+        // The floor probably means that we are rounding out of the -PI lower bound.
+        // I dont think this is a HUGE issue since we would just wrap the value when the state is
+        // constructed anyways.
+        // assert!(b >= -PI && b <= PI);
+
+        State::new(
+            state.x as f64 * self.dx,
+            state.y as f64 * self.dy,
+            state.z as f64 * self.dz,
+            b,
+        )
     }
 }
 
@@ -264,9 +316,9 @@ impl World {
 
     fn insert(&mut self, state: State) -> Uuid {
         let id = Uuid::new_v4();
-        let aligned = self.discretizer.discretize(&state);
+        let aligned = self.discretizer.discrete(&state);
 
-        if let Some(_) = self.ids.insert(aligned, id) {
+        if let Some(_) = self.ids.insert(aligned.clone(), id) {
             panic!("attempted to overwrite a state that already exists");
         }
 
@@ -274,7 +326,7 @@ impl World {
             id,
             Vertex {
                 id,
-                state,
+                state: aligned,
                 successors: None,
             },
         ) {
@@ -285,15 +337,24 @@ impl World {
     }
 
     fn id(&self, state: &State) -> Option<&Uuid> {
-        self.ids.get(&self.discretizer.discretize(state))
+        self.ids.get(&self.discretizer.discrete(state))
     }
 
-    pub fn state(&self, id: &Uuid) -> &State {
-        &self.vertex(id).state
+    pub fn state(&self, id: &Uuid) -> State {
+        self.discretizer.continuous(&self.vertex(id).state)
+    }
+
+    pub fn state_count(&self) -> usize {
+        assert_eq!(self.ids.len(), self.vertices.len());
+        self.ids.len()
+    }
+
+    pub fn walk_from(&self, id: &Uuid) -> Vec<Uuid> {
+        self.vertex(id).successors.clone().unwrap_or_default()
     }
 
     pub fn successors(&mut self, id: &Uuid) -> Vec<Uuid> {
-        let vertex = self.vertex(&id);
+        let vertex = self.vertex(id);
 
         // The vertex we are looking at could have had its successor states already computed.
         // In this case, we likely want to have those connections cached, so that we avoid
@@ -306,8 +367,11 @@ impl World {
         // all of the successors using the motion primitives.
         let successors: Vec<_> = self
             .airplane
-            .move_from(&vertex.state)
+            .move_from(&self.discretizer.continuous(&vertex.state))
             .into_iter()
+            // If the discretization is more coarse than the motion primitives, we can end up with
+            // non-unique successor states.
+            // FIXME: Why doesn't the self.id check handle this case?
             .map(|state| {
                 // It is likely that some of these successors have already been added to the world by other
                 // states.
@@ -330,23 +394,25 @@ impl World {
 
         self.vertex_mut(id).successors = Some(successors.clone());
 
+        assert_eq!(successors.len(), 9);
+
         successors
     }
 }
 
-const V: f64 = 100.;
+const V: f64 = 0.1;
 const DT: f64 = 30.;
 const DXY: f64 = V * DT;
-const DZ: f64 = 6. * DT;
+const DZ: f64 = 0.006 * DT;
 const DB: f64 = 0.025 * DT;
 
 impl ARAPlanner {
     pub fn create_plan(&self, start: State) -> ARAPlan {
         let mut world = World::new(Discretizer {
-            dx: DXY,
-            dy: DXY,
-            dz: DZ,
-            db: DB,
+            dx: 0.125,
+            dy: 0.125,
+            dz: 0.05,
+            db: 0.05,
         });
 
         let start_id = world.insert(start).clone();
@@ -358,6 +424,7 @@ impl ARAPlanner {
             incons_set: HashSet::new(),
             g_vals: HashMap::new(),
             h_vals: HashMap::new(),
+            eps: self.start_eps,
             start_id,
             goal_id: None,
             goal_f_val: f64::INFINITY,
@@ -393,8 +460,22 @@ impl ARAPlan {
         self.g_vals.entry(*id).or_insert(f64::INFINITY)
     }
 
+    fn h_val(&self, id: &Uuid) -> f64 {
+        // TODO: make this dubins airplane
+        self.world
+            .state(id)
+            .euclidean_dist_to(&self.goal_region.center())
+    }
+
+    fn f_val(&self, id: &Uuid) -> f64 {
+        self.g_val(id) + self.eps * self.h_val(id)
+    }
+
     fn open(&mut self, id: Uuid) {
-        self.open_set.push(OpenVertex { id, f: 0. })
+        self.open_set.push(OpenVertex {
+            id,
+            f: self.f_val(&id),
+        })
     }
 
     fn close(&mut self, id: Uuid) {
@@ -405,8 +486,8 @@ impl ARAPlan {
         self.closed_set.contains(id)
     }
 
-    fn mark_incons(&self, _id: Uuid) {
-        todo!()
+    fn mark_incons(&mut self, id: Uuid) {
+        self.incons_set.insert(id);
     }
 
     fn suboptimality(&self) -> f64 {
@@ -416,10 +497,7 @@ impl ARAPlan {
 
     fn clean_open_set(&mut self) {
         while let Some(v) = self.open_set.peek() {
-            let g_val = *self.g_val(&v.id);
-            // TODO: This should be an f val
-            // Need to write the heuristic stuff first.
-            if v.f != g_val {
+            if v.f != self.f_val(&v.id) {
                 self.open_set.pop();
             } else {
                 break;
@@ -441,6 +519,7 @@ impl ARAPlan {
     }
 
     fn successors(&mut self, id: Uuid) -> Vec<Uuid> {
+        // TODO: cache the heuristic here
         self.world.successors(&id)
     }
 
@@ -453,28 +532,25 @@ impl ARAPlan {
     }
 
     fn improve_path(&mut self) {
-        loop {
+        let iters = 100000;
+        for _ in 0..iters {
             self.clean_open_set();
             let peeked = self.peek();
-            // TODO: this should be f_val
-            if self.goal_f_val <= *self.g_val(&peeked) {
+            if self.goal_f_val <= self.f_val(&peeked) {
                 break;
             }
 
             let id = self.pop();
 
-            println!("{id}");
-
             for succ in self.successors(id) {
-                println!("succ: {succ}");
-
                 let cost = self.g_val(&id) + self.cost(&id, &succ);
 
                 // Save as the goal if inside the goal region
                 if self.goal_id.is_none() {
                     if self.goal_region.contains(&self.world.state(&succ)) {
+                        println!("found goal region");
+                        self.goal_f_val = self.f_val(&succ);
                         self.goal_id = Some(succ);
-                        self.goal_f_val = cost;
                     }
                 }
 
@@ -487,10 +563,50 @@ impl ARAPlan {
                     if !self.is_closed(&succ) {
                         self.open(succ)
                     }
+                    // TODO: this should be f_val
                     // otherwise insert it into incons
                     else {
                         self.mark_incons(succ);
                     }
+                }
+            }
+        }
+
+        println!("state count: {}", self.world.state_count());
+
+        let path = format!("path_{iters}.g");
+        let file = File::create(&path).unwrap();
+        let mut writer = BufWriter::new(file);
+
+        let mut visited = HashSet::new();
+        let mut queue: VecDeque<Uuid> = VecDeque::new();
+
+        queue.push_back(self.start_id);
+
+        while let Some(id) = queue.pop_front() {
+            visited.insert(id);
+            let state = self.world.state(&id);
+            let _ = writeln!(
+                writer,
+                "v {} {} {} {} {}",
+                id,
+                state.x,
+                state.y,
+                state.z,
+                state.bearing()
+            );
+
+            let successors = self.world.walk_from(&id);
+            assert!(successors.len() == 9 || successors.len() == 0);
+
+            if let Some(best) = successors.into_iter().min_by(|id1, id2| {
+                self.f_val(&id1)
+                    .partial_cmp(&self.f_val(&id2))
+                    .expect("not nan")
+            }) {
+                let _ = writeln!(writer, "e {} {}", id, best);
+                if !visited.contains(&best) {
+                    queue.push_back(best);
                 }
             }
         }
@@ -519,4 +635,49 @@ impl PartialOrd for OpenVertex {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.cmp(&other))
     }
+}
+
+#[test]
+fn distinct_successors() {
+    // No successor corresponds to the same aligned state or id.
+    let start_state = State::new(10.0, 10.0, 5.0, 0.0);
+    let mut world = World::new(Discretizer {
+        dx: 0.125,
+        dy: 0.125,
+        dz: 0.05,
+        db: 0.05,
+    });
+
+    let start_id = world.insert(start_state);
+
+    let mut ids = HashSet::new();
+    let mut states = HashSet::new();
+
+    ids.insert(start_id);
+    states.insert(world.vertex(&start_id).state.clone());
+
+    for succ in world.successors(&start_id) {
+        let state = &world.vertex(&succ).state;
+
+        println!("{succ}: {state:#?}");
+        assert!(!ids.contains(&succ));
+        assert!(!states.contains(state));
+
+        ids.insert(succ);
+        states.insert(state.clone());
+    }
+}
+
+#[test]
+fn region_center() {
+    assert_eq!(
+        StateRegion {
+            x: -0.5..0.5,
+            y: -0.5..0.5,
+            z: -0.25..0.25,
+            b: -0.125..0.125,
+        }
+        .center(),
+        State::new(0.0, 0.0, 0.0, 0.0)
+    );
 }
