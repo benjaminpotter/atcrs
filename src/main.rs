@@ -1,4 +1,6 @@
+use dubins_paths::DubinsPath;
 use radians::Wrap64;
+use std::f64::consts::PI;
 use std::io::Write;
 use std::{
     collections::{BinaryHeap, HashMap, HashSet, VecDeque},
@@ -11,10 +13,10 @@ use uuid::Uuid;
 fn main() {
     let start_state = State::new(-1.0, 0.0, 1.0, 0.0);
     let mut world = World::new(Discretizer {
-        dx: DXY,
-        dy: DXY,
-        dz: DZ,
-        db: DB,
+        dx: XY,
+        dy: XY,
+        dz: Z,
+        db: B,
     });
 
     // let start_id = world.insert(start_state);
@@ -197,49 +199,49 @@ impl Airplane {
     pub fn new() -> Self {
         let motions = [
             Motion {
-                dxy: DXY,
-                dz: -DZ,
-                db: -DB,
+                dxy: XY,
+                dz: -Z,
+                db: -B,
             },
             Motion {
-                dxy: DXY,
-                dz: -DZ,
+                dxy: XY,
+                dz: -Z,
                 db: 0.,
             },
             Motion {
-                dxy: DXY,
-                dz: -DZ,
-                db: DB,
+                dxy: XY,
+                dz: -Z,
+                db: B,
             },
             Motion {
-                dxy: DXY,
+                dxy: XY,
                 dz: 0.,
-                db: -DB,
+                db: -B,
             },
             Motion {
-                dxy: DXY,
+                dxy: XY,
                 dz: 0.,
                 db: 0.,
             },
             Motion {
-                dxy: DXY,
+                dxy: XY,
                 dz: 0.,
-                db: DB,
+                db: B,
             },
             Motion {
-                dxy: DXY,
-                dz: DZ,
-                db: -DB,
+                dxy: XY,
+                dz: Z,
+                db: -B,
             },
             Motion {
-                dxy: DXY,
-                dz: DZ,
+                dxy: XY,
+                dz: Z,
                 db: 0.,
             },
             Motion {
-                dxy: DXY,
-                dz: DZ,
-                db: DB,
+                dxy: XY,
+                dz: Z,
+                db: B,
             },
         ];
 
@@ -401,10 +403,13 @@ impl World {
 }
 
 const V: f64 = 0.1;
-const DT: f64 = 30.;
-const DXY: f64 = V * DT;
-const DZ: f64 = 0.006 * DT;
-const DB: f64 = 0.025 * DT;
+const D_T: f64 = 30.;
+const D_Z: f64 = 0.006;
+const D_B: f64 = 0.025;
+
+const XY: f64 = V * D_T;
+const Z: f64 = D_Z * D_T;
+const B: f64 = D_B * D_T;
 
 impl ARAPlanner {
     pub fn create_plan(&self, start: State) -> ARAPlan {
@@ -461,10 +466,23 @@ impl ARAPlan {
     }
 
     fn h_val(&self, id: &Uuid) -> f64 {
-        // TODO: make this dubins airplane
-        self.world
-            .state(id)
-            .euclidean_dist_to(&self.goal_region.center())
+        let state = self.world.state(id);
+        let q0 = [state.x, state.y, state.bearing()].into();
+        // TODO: might not need to recompute
+        // want to cache this somewhere
+        let goal = self.goal_region.center();
+        let q1 = [goal.x, goal.y, goal.bearing()].into();
+        // TODO: This should maybe be computed by the airplane?
+        let rho = D_B / V;
+        let shortest_path = DubinsPath::shortest_from(q0, q1, rho).expect("should get a path");
+        let dist_xy = shortest_path.length();
+        let mut t_min = dist_xy / V;
+        let t_z = (state.z - goal.z).abs() / D_Z;
+        while t_z < t_min {
+            t_min += 2. * PI / D_B;
+        }
+
+        ((V * t_min).powf(2.) + (state.z - goal.z).powf(2.)).sqrt()
     }
 
     fn f_val(&self, id: &Uuid) -> f64 {
@@ -532,7 +550,7 @@ impl ARAPlan {
     }
 
     fn improve_path(&mut self) {
-        let iters = 100000;
+        let iters = 1000;
         for _ in 0..iters {
             self.clean_open_set();
             let peeked = self.peek();

@@ -84,6 +84,7 @@ dependencies = [
  "chrono",
  "clap",
  "csv",
+ "dubins_paths",
  "radians",
  "reqwest",
  "serde",
@@ -259,6 +260,12 @@ dependencies = [
  "quote",
  "syn",
 ]
+
+[[package]]
+name = "dubins_paths"
+version = "2.7.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4cea666e729d423ed22682c6787fb627f14d664b611fe7a9087608fd581a5888"
 
 [[package]]
 name = "encoding_rs"
