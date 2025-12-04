@@ -2,6 +2,7 @@ use dubins_paths::DubinsPath;
 use radians::Wrap64;
 use std::f64::consts::PI;
 use std::io::Write;
+use std::path::Path;
 use std::{
     collections::{BinaryHeap, HashMap, HashSet, VecDeque},
     fs::File,
@@ -11,26 +12,15 @@ use std::{
 use uuid::Uuid;
 
 fn main() {
-    let start_state = State::new(-1.0, 0.0, 1.0, 0.0);
-    let mut world = World::new(Discretizer {
-        dx: XY,
-        dy: XY,
-        dz: Z,
-        db: B,
-    });
-
-    // let start_id = world.insert(start_state);
-    // let successors = world.successors(&start_id);
-    //
-    // println!("{:#?}", world.state(&start_id));
-    // for succ in successors {
-    //     println!("{:#?}", world.state(&succ));
-    // }
-
+    // let start = State::new(-50.0, 0.0, 5.0, 0.0);
+    // let start = State::new(-50.0, 0.0, 5.0, PI * 3.0 / 4.0);
+    let start = State::new(50.0, 0.0, 5.0, PI); // FIXME: Problem
+    // let start = State::new(-50.0, 0.0, 5.0, PI * 3.9 / 4.0);
+    let start_eps = 4.0;
+    let eps_delta = 0.5;
+    let stop_eps = 1.0;
+    let max_iters = 2000000;
     let planner = ARAPlanner {
-        start_eps: 4.0,
-        eps_delta: 0.5,
-        suboptimality: 1.0,
         goal_region: StateRegion {
             x: -0.5..0.5,
             y: -0.5..0.5,
@@ -39,12 +29,19 @@ fn main() {
         },
     };
 
-    let mut plan = planner.create_plan(start_state);
+    let mut plan = planner.create_plan(start);
     println!("{:#?}", plan);
 
     // TODO: Replace with timing logic.
-    for _ in 0..1 {
-        plan = planner.plan_from(plan.clone());
+    for i in 0..1 {
+        // TODO: eps -= eps_delta;
+        plan = planner.plan_from(plan.clone(), start_eps, max_iters);
+
+        println!("start writing to file");
+        let path = format!("plan_{max_iters}.g");
+        // plan.print_to_file(&path);
+        plan.print_solution_to_file(&path);
+        println!("wrote {path}");
     }
 }
 
@@ -67,9 +64,17 @@ struct StateRegion {
 }
 
 #[derive(Clone, Debug)]
+struct Weight {
+    cost_to_go: f64,
+    cost_to_come: f64,
+}
+
+#[derive(Clone, Debug)]
 struct Vertex {
     id: Uuid,
     state: AlignedState,
+    weight: Weight,
+    parent: Option<Uuid>,
     successors: Option<Vec<Uuid>>,
 }
 
@@ -119,13 +124,10 @@ struct World {
 #[derive(Clone, Debug)]
 struct OpenVertex {
     id: Uuid,
-    f: f64,
+    priority: f64,
 }
 
 struct ARAPlanner {
-    start_eps: f64,
-    eps_delta: f64,
-    suboptimality: f64,
     goal_region: StateRegion,
 }
 
@@ -140,9 +142,6 @@ struct ARAPlan {
     open_set: BinaryHeap<OpenVertex>,
     closed_set: HashSet<Uuid>,
     incons_set: HashSet<Uuid>,
-    g_vals: HashMap<Uuid, f64>,
-    h_vals: HashMap<Uuid, f64>,
-    eps: f64,
 
     start_id: Uuid,
     goal_id: Option<Uuid>,
@@ -169,7 +168,9 @@ impl State {
     }
 
     pub fn bearing(&self) -> f64 {
-        self.b.val()
+        let val = self.b.val();
+        assert!(val >= -PI && val <= PI);
+        val
     }
 }
 
@@ -192,6 +193,48 @@ impl StateRegion {
             Self::center_between(&self.z),
             Self::center_between(&self.b),
         )
+    }
+}
+
+const RHO: f64 = D_B / V;
+
+impl Weight {
+    pub fn from_cost_to_go_and_target(cost_to_go: f64, to: &State, target: &State) -> Self {
+        Weight {
+            cost_to_go,
+            cost_to_come: Self::cost_to_come(to, target),
+        }
+    }
+
+    pub fn from_states(from: &State, with: &Weight, to: &State, target: &State) -> Self {
+        Weight {
+            cost_to_go: Self::cost_to_go(from, with, to),
+            cost_to_come: Self::cost_to_come(to, target),
+        }
+    }
+
+    pub fn cost(&self, inflation: f64) -> f64 {
+        self.cost_to_go + inflation * self.cost_to_come
+    }
+
+    #[inline(never)]
+    fn cost_to_come(state: &State, target: &State) -> f64 {
+        // TODO: this should be abstracted...
+        let q0 = [state.x, state.y, state.bearing()].into();
+        let q1 = [target.x, target.y, target.bearing()].into();
+        let shortest_path = DubinsPath::shortest_from(q0, q1, RHO).expect("should get a path");
+        let dist_xy = shortest_path.length();
+        let mut t_min = dist_xy / V;
+        let t_z = (state.z - target.z).abs() / D_Z;
+        while t_z > t_min {
+            t_min += 2. * PI / D_B;
+        }
+
+        ((V * t_min).powf(2.) + (state.z - target.z).powf(2.)).sqrt()
+    }
+
+    fn cost_to_go(from: &State, with: &Weight, to: &State) -> f64 {
+        with.cost_to_go + from.euclidean_dist_to(&to)
     }
 }
 
@@ -316,7 +359,7 @@ impl World {
             .expect("never look for a vertex that does not exist")
     }
 
-    fn insert(&mut self, state: State) -> Uuid {
+    fn insert(&mut self, state: State, weight: Weight, parent: Option<Uuid>) -> Uuid {
         let id = Uuid::new_v4();
         let aligned = self.discretizer.discrete(&state);
 
@@ -329,6 +372,8 @@ impl World {
             Vertex {
                 id,
                 state: aligned,
+                weight,
+                parent,
                 successors: None,
             },
         ) {
@@ -351,11 +396,32 @@ impl World {
         self.ids.len()
     }
 
-    pub fn walk_from(&self, id: &Uuid) -> Vec<Uuid> {
-        self.vertex(id).successors.clone().unwrap_or_default()
+    pub fn weight(&self, id: &Uuid) -> &Weight {
+        &self.vertex(id).weight
     }
 
-    pub fn successors(&mut self, id: &Uuid) -> Vec<Uuid> {
+    pub fn weight_mut(&mut self, id: &Uuid) -> &mut Weight {
+        &mut self.vertex_mut(id).weight
+    }
+
+    pub fn parent(&self, id: &Uuid) -> &Option<Uuid> {
+        &self.vertex(id).parent
+    }
+
+    pub fn parent_mut(&mut self, id: &Uuid) -> &mut Option<Uuid> {
+        &mut self.vertex_mut(id).parent
+    }
+
+    pub fn walk_from(&self, id: &Uuid) -> Vec<Uuid> {
+        let successors = self.vertex(id).successors.clone().unwrap_or_default();
+        assert!(successors.len() == 9 || successors.len() == 0);
+        successors
+    }
+
+    pub fn successors<F>(&mut self, id: &Uuid, scale: F) -> Vec<Uuid>
+    where
+        F: Fn(&State) -> Weight,
+    {
         let vertex = self.vertex(id);
 
         // The vertex we are looking at could have had its successor states already computed.
@@ -382,15 +448,22 @@ impl World {
                 // that vertex yet.
                 // If we have to update their successor list, then we will do so when this function is
                 // called from their context.
+                // NOTE: We could imagine that the cost-to-go from this state is better than the
+                // previous time we visited this node so we want to update it here.
+                // I think this will be handled by the main execution loop once it gets the ids of
+                // provided by this function.
+                // However, this is not ideal because it leads to multiple lookups for the same id.
                 if let Some(id) = self.id(&state) {
                     return id.clone();
                 }
+
+                let weight = scale(&state);
 
                 // If this successor is not in our world yet, then we have to create a vertex for
                 // it.
                 // We return the id of the new vertex so that it gets included in our successor
                 // list.
-                self.insert(state)
+                self.insert(state, weight, Some(*id))
             })
             .collect();
 
@@ -420,80 +493,101 @@ impl ARAPlanner {
             db: 0.05,
         });
 
-        let start_id = world.insert(start).clone();
+        let weight = Weight::from_cost_to_go_and_target(0., &start, &self.goal_region.center());
+        let start_id = world.insert(start, weight, None).clone();
 
         let mut plan = ARAPlan {
             world,
             open_set: BinaryHeap::new(),
             closed_set: HashSet::new(),
             incons_set: HashSet::new(),
-            g_vals: HashMap::new(),
-            h_vals: HashMap::new(),
-            eps: self.start_eps,
             start_id,
             goal_id: None,
             goal_f_val: f64::INFINITY,
             goal_region: self.goal_region.clone(),
         };
 
-        *plan.g_val_mut(&start_id) = 0.;
-        plan.open(start_id);
+        // NOTE: We can put a cost of zero here because it will be updated when plan_from is
+        // called.
+        plan.open(start_id, 0.0);
 
         plan
     }
 
-    pub fn plan_from(&self, mut plan: ARAPlan) -> ARAPlan {
-        if plan.suboptimality() > self.suboptimality {
-            // TODO: eps -= eps_delta;
-            // TODO: move states from incons to open
-            // TODO: update priorities of open using f values
-            // TODO: reset the closed set
+    pub fn plan_from(&self, mut plan: ARAPlan, eps: f64, max_iters: usize) -> ARAPlan {
+        let open_vertices: Vec<_> = plan
+            .incons_set
+            .drain()
+            .chain(plan.open_set.drain().map(|ov| ov.id))
+            .collect();
 
-            plan.improve_path();
+        for id in open_vertices {
+            let priority = plan.world.weight(&id).cost(eps);
+            plan.open(id, priority);
+        }
+
+        plan.closed_set.clear();
+
+        for _ in 0..max_iters {
+            let id = plan.pop();
+            if plan.goal_f_val <= plan.world.weight(&id).cost(eps) {
+                break;
+            }
+
+            let state = plan.world.state(&id);
+            let weight = plan.world.weight(&id).clone();
+
+            // Save as the goal if inside the goal region
+            if plan.goal_id.is_none() {
+                if plan.goal_region.contains(&state) {
+                    println!("found goal region");
+                    plan.goal_f_val = weight.cost(eps);
+                    plan.goal_id = Some(id);
+                }
+            }
+            let successors = plan.world.successors(&id, |state| {
+                Weight::from_cost_to_go_and_target(f64::INFINITY, state, &self.goal_region.center())
+            });
+
+            assert_eq!(successors.len(), 9);
+
+            for succ in successors {
+                let succ_state = plan.world.state(&succ);
+                let succ_weight = plan.world.weight_mut(&succ);
+                let cost = succ_weight.cost(eps);
+                let cost_to_go = Weight::cost_to_go(&state, &weight, &succ_state);
+
+                // if succ is better through s then
+                if cost_to_go < succ_weight.cost_to_go {
+                    // update its g value
+                    succ_weight.cost_to_go = cost_to_go;
+
+                    // set this as the parent
+                    *plan.world.parent_mut(&succ) = Some(id);
+
+                    // if its not in closed then insert it into open
+                    if !plan.is_closed(&succ) {
+                        plan.open(succ, cost)
+                    }
+                    // otherwise insert it into incons
+                    else {
+                        plan.mark_incons(succ);
+                    }
+                }
+            }
         }
 
         plan
+    }
+
+    fn successors(&self, _id: &Uuid) -> Vec<Uuid> {
+        todo!()
     }
 }
 
 impl ARAPlan {
-    fn g_val(&self, id: &Uuid) -> &f64 {
-        self.g_vals.get(id).unwrap_or(&f64::INFINITY)
-    }
-
-    fn g_val_mut(&mut self, id: &Uuid) -> &mut f64 {
-        self.g_vals.entry(*id).or_insert(f64::INFINITY)
-    }
-
-    fn h_val(&self, id: &Uuid) -> f64 {
-        let state = self.world.state(id);
-        let q0 = [state.x, state.y, state.bearing()].into();
-        // TODO: might not need to recompute
-        // want to cache this somewhere
-        let goal = self.goal_region.center();
-        let q1 = [goal.x, goal.y, goal.bearing()].into();
-        // TODO: This should maybe be computed by the airplane?
-        let rho = D_B / V;
-        let shortest_path = DubinsPath::shortest_from(q0, q1, rho).expect("should get a path");
-        let dist_xy = shortest_path.length();
-        let mut t_min = dist_xy / V;
-        let t_z = (state.z - goal.z).abs() / D_Z;
-        while t_z < t_min {
-            t_min += 2. * PI / D_B;
-        }
-
-        ((V * t_min).powf(2.) + (state.z - goal.z).powf(2.)).sqrt()
-    }
-
-    fn f_val(&self, id: &Uuid) -> f64 {
-        self.g_val(id) + self.eps * self.h_val(id)
-    }
-
-    fn open(&mut self, id: Uuid) {
-        self.open_set.push(OpenVertex {
-            id,
-            f: self.f_val(&id),
-        })
+    fn open(&mut self, id: Uuid, priority: f64) {
+        self.open_set.push(OpenVertex { id, priority })
     }
 
     fn close(&mut self, id: Uuid) {
@@ -513,127 +607,81 @@ impl ARAPlan {
         10.0
     }
 
-    fn clean_open_set(&mut self) {
-        while let Some(v) = self.open_set.peek() {
-            if v.f != self.f_val(&v.id) {
-                self.open_set.pop();
-            } else {
-                break;
-            }
-        }
-    }
-
-    fn peek(&self) -> Uuid {
-        self.open_set
-            .peek()
-            .expect("the open set is never empty")
-            .id
-    }
-
     fn pop(&mut self) -> Uuid {
         let id = self.open_set.pop().expect("the open set is never empty").id;
         self.close(id);
         id
     }
 
-    fn successors(&mut self, id: Uuid) -> Vec<Uuid> {
-        // TODO: cache the heuristic here
-        self.world.successors(&id)
-    }
-
-    fn cost(&self, start: &Uuid, end: &Uuid) -> f64 {
-        // This function can only be used to compare adjacent vertices
-        // TODO: maybe we should have an assertion here
-        self.world
-            .state(start)
-            .euclidean_dist_to(&self.world.state(end))
-    }
-
-    fn improve_path(&mut self) {
-        let iters = 1000;
-        for _ in 0..iters {
-            self.clean_open_set();
-            let peeked = self.peek();
-            if self.goal_f_val <= self.f_val(&peeked) {
-                break;
-            }
-
-            let id = self.pop();
-
-            for succ in self.successors(id) {
-                let cost = self.g_val(&id) + self.cost(&id, &succ);
-
-                // Save as the goal if inside the goal region
-                if self.goal_id.is_none() {
-                    if self.goal_region.contains(&self.world.state(&succ)) {
-                        println!("found goal region");
-                        self.goal_f_val = self.f_val(&succ);
-                        self.goal_id = Some(succ);
-                    }
-                }
-
-                // if succ is better through s then
-                if cost < *self.g_val(&succ) {
-                    // update its g value
-                    *self.g_val_mut(&succ) = cost;
-
-                    // if its not in closed then insert it into open
-                    if !self.is_closed(&succ) {
-                        self.open(succ)
-                    }
-                    // TODO: this should be f_val
-                    // otherwise insert it into incons
-                    else {
-                        self.mark_incons(succ);
-                    }
-                }
-            }
-        }
-
+    fn print_to_file<P: AsRef<Path>>(&self, path: P) {
         println!("state count: {}", self.world.state_count());
 
-        let path = format!("path_{iters}.g");
         let file = File::create(&path).unwrap();
         let mut writer = BufWriter::new(file);
+        // let mut writer = std::io::stdout();
 
         let mut visited = HashSet::new();
         let mut queue: VecDeque<Uuid> = VecDeque::new();
-
         queue.push_back(self.start_id);
 
         while let Some(id) = queue.pop_front() {
+            if visited.contains(&id) {
+                continue;
+            }
+
             visited.insert(id);
+
             let state = self.world.state(&id);
+            let weight = self.world.weight(&id);
             let _ = writeln!(
                 writer,
-                "v {} {} {} {} {}",
+                "v {} {:.2} {:.2} {:.2} {:.2} {:.2} {:.2}",
                 id,
                 state.x,
                 state.y,
                 state.z,
-                state.bearing()
+                state.bearing(),
+                weight.cost_to_go,
+                weight.cost_to_come,
             );
 
-            let successors = self.world.walk_from(&id);
-            assert!(successors.len() == 9 || successors.len() == 0);
-
-            if let Some(best) = successors.into_iter().min_by(|id1, id2| {
-                self.f_val(&id1)
-                    .partial_cmp(&self.f_val(&id2))
-                    .expect("not nan")
-            }) {
-                let _ = writeln!(writer, "e {} {}", id, best);
-                if !visited.contains(&best) {
-                    queue.push_back(best);
-                }
+            for succ in self.world.walk_from(&id) {
+                // let _ = writeln!(writer, "e {} {}", id, succ);
+                queue.push_back(succ);
             }
+        }
+    }
+
+    fn print_solution_to_file(&self, path: &str) {
+        println!("state count: {}", self.world.state_count());
+
+        let file = File::create(&path).unwrap();
+        let mut writer = BufWriter::new(file);
+
+        let mut parent = &self.goal_id;
+        while let Some(id) = parent.as_ref() {
+            let state = self.world.state(&id);
+            let weight = self.world.weight(&id);
+            let _ = writeln!(
+                writer,
+                "v {} {:.2} {:.2} {:.2} {:.2} {:.2} {:.2}",
+                id,
+                state.x,
+                state.y,
+                state.z,
+                state.bearing(),
+                weight.cost_to_go,
+                weight.cost_to_come,
+            );
+
+            parent = self.world.parent(&id);
         }
     }
 }
 
 impl PartialEq for OpenVertex {
     fn eq(&self, other: &Self) -> bool {
-        self.f == other.f && self.id == other.id
+        self.priority == other.priority && self.id == other.id
     }
 }
 
@@ -641,10 +689,12 @@ impl Eq for OpenVertex {}
 
 impl Ord for OpenVertex {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        other
-            .f
-            .partial_cmp(&other.f)
+        self.priority
+            .partial_cmp(&other.priority)
             .expect("we should ensure that floats are always ordered")
+            // Lower priorities get ordered above.
+            .reverse()
+            // Break ties with id
             .then_with(|| self.id.cmp(&other.id))
     }
 }
@@ -658,7 +708,8 @@ impl PartialOrd for OpenVertex {
 #[test]
 fn distinct_successors() {
     // No successor corresponds to the same aligned state or id.
-    let start_state = State::new(10.0, 10.0, 5.0, 0.0);
+    let start = State::new(-75.0, 0.0, 5.0, 0.0);
+    let target = State::new(0.0, 0.0, 0.0, 0.0);
     let mut world = World::new(Discretizer {
         dx: 0.125,
         dy: 0.125,
@@ -666,7 +717,8 @@ fn distinct_successors() {
         db: 0.05,
     });
 
-    let start_id = world.insert(start_state);
+    let weight = Weight::from_cost_to_go_and_target(0., &start, &target);
+    let start_id = world.insert(start, weight);
 
     let mut ids = HashSet::new();
     let mut states = HashSet::new();
@@ -674,7 +726,9 @@ fn distinct_successors() {
     ids.insert(start_id);
     states.insert(world.vertex(&start_id).state.clone());
 
-    for succ in world.successors(&start_id) {
+    for succ in world.successors(&start_id, |from, with, to| {
+        Weight::from_states(from, with, to, &target)
+    }) {
         let state = &world.vertex(&succ).state;
 
         println!("{succ}: {state:#?}");
@@ -697,5 +751,33 @@ fn region_center() {
         }
         .center(),
         State::new(0.0, 0.0, 0.0, 0.0)
+    );
+}
+
+#[test]
+fn region_contains() {
+    assert!(
+        StateRegion {
+            x: -0.5..0.5,
+            y: -0.5..0.5,
+            z: -0.25..0.25,
+            b: -0.125..0.125,
+        }
+        .contains(&State::new(0.0, 0.0, 0.0, 0.0))
+    );
+}
+
+#[test]
+fn vertex_ordering() {
+    use uuid::uuid;
+
+    assert!(
+        OpenVertex {
+            id: uuid!("be8e8538-c1fa-49d4-8c15-77c4bbd63cf2"),
+            priority: 100.0,
+        } < OpenVertex {
+            id: uuid!("93879c82-f9aa-439e-8c96-e2589ef726b3"),
+            priority: 10.0,
+        }
     );
 }

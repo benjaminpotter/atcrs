@@ -266,6 +266,9 @@ name = "dubins_paths"
 version = "2.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4cea666e729d423ed22682c6787fb627f14d664b611fe7a9087608fd581a5888"
+dependencies = [
+ "glam 0.30.9",
+]
 
 [[package]]
 name = "encoding_rs"

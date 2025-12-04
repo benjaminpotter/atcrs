@@ -3,12 +3,15 @@ name = "atcrs"
 version = "0.1.0"
 edition = "2024"
 
+[profile.release]
+debug = true
+
 [dependencies]
 anyhow = "1.0.100"
 chrono = { version = "0.4.42", features = ["serde"] }
 clap = { version = "4.5.51", features = ["derive"] }
 csv = "1.4.0"
-dubins_paths = { version = "2.7.1", features = ["f64"] }
+dubins_paths = { version = "2.7.1", features = ["f64", "glam"] }
 radians = "0.3.1"
 reqwest = { version = "0.12", features = ["json"] }
 serde = "1.0.228"
