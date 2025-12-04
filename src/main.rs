@@ -16,10 +16,10 @@ fn main() {
     // let start = State::new(-50.0, 0.0, 5.0, PI * 3.0 / 4.0);
     let start = State::new(50.0, 0.0, 5.0, PI); // FIXME: Problem
     // let start = State::new(-50.0, 0.0, 5.0, PI * 3.9 / 4.0);
-    let start_eps = 4.0;
-    let eps_delta = 0.5;
+    let start_eps = 3.0;
+    let eps_delta = 0.02;
     let stop_eps = 1.0;
-    let max_iters = 2000000;
+    // let max_iters = 2000000;
     let planner = ARAPlanner {
         goal_region: StateRegion {
             x: -0.5..0.5,
@@ -35,10 +35,10 @@ fn main() {
     // TODO: Replace with timing logic.
     for i in 0..1 {
         // TODO: eps -= eps_delta;
-        plan = planner.plan_from(plan.clone(), start_eps, max_iters);
+        plan = planner.plan_from(plan.clone(), start_eps, None);
 
         println!("start writing to file");
-        let path = format!("plan_{max_iters}.g");
+        let path = format!("plan.g");
         // plan.print_to_file(&path);
         plan.print_solution_to_file(&path);
         println!("wrote {path}");
@@ -147,6 +147,8 @@ struct ARAPlan {
     goal_id: Option<Uuid>,
     goal_f_val: f64,
     goal_region: StateRegion,
+
+    iters: usize,
 }
 
 impl State {
@@ -505,6 +507,7 @@ impl ARAPlanner {
             goal_id: None,
             goal_f_val: f64::INFINITY,
             goal_region: self.goal_region.clone(),
+            iters: 0,
         };
 
         // NOTE: We can put a cost of zero here because it will be updated when plan_from is
@@ -514,7 +517,7 @@ impl ARAPlanner {
         plan
     }
 
-    pub fn plan_from(&self, mut plan: ARAPlan, eps: f64, max_iters: usize) -> ARAPlan {
+    pub fn plan_from(&self, mut plan: ARAPlan, eps: f64, max_iters: Option<usize>) -> ARAPlan {
         let open_vertices: Vec<_> = plan
             .incons_set
             .drain()
@@ -528,7 +531,13 @@ impl ARAPlanner {
 
         plan.closed_set.clear();
 
-        for _ in 0..max_iters {
+        loop {
+            if let Some(max) = max_iters {
+                if plan.iters > max {
+                    break;
+                }
+            }
+
             let id = plan.pop();
             if plan.goal_f_val <= plan.world.weight(&id).cost(eps) {
                 break;
@@ -575,13 +584,11 @@ impl ARAPlanner {
                     }
                 }
             }
+
+            plan.iters += 1;
         }
 
         plan
-    }
-
-    fn successors(&self, _id: &Uuid) -> Vec<Uuid> {
-        todo!()
     }
 }
 
