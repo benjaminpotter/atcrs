@@ -13,6 +13,7 @@ clap = { version = "4.5.51", features = ["derive"] }
 csv = "1.4.0"
 dubins_paths = { version = "2.7.1", features = ["f64", "glam"] }
 radians = "0.3.1"
+rand = { version = "0.9.2", features = ["small_rng"] }
 reqwest = { version = "0.12", features = ["json"] }
 serde = "1.0.228"
 serde_json = "1.0.145"
