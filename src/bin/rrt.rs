@@ -1,14 +1,21 @@
+use dubins_paths::DubinsPath;
+use rand::{Rng, SeedableRng, rngs::SmallRng};
 use std::{
-    collections::{HashSet, VecDeque},
     f64::consts::{E, PI},
     fs::File,
     io::{BufWriter, Write},
     marker::PhantomData,
     path::Path,
+    time::Instant,
 };
 
-use dubins_paths::DubinsPath;
-use rand::{Rng, SeedableRng, rngs::SmallRng};
+#[derive(serde::Serialize)]
+struct BenchSample {
+    iters: usize,
+    state_count: usize,
+    duration_ms: f64,
+    iters_per_ms: f64,
+}
 
 fn main() {
     let max_iters = 10_000;
@@ -22,13 +29,29 @@ fn main() {
     let goal = State([0., 0., 0., 0.]);
     let mut plan = planner.create_plan(start, goal, 0);
 
+    let mut samples = Vec::new();
+
     let polling_frequency = 100;
     let outer = max_iters / polling_frequency;
     for i in 0..outer {
+        let start = Instant::now();
         for _ in 0..polling_frequency {
             plan = planner.plan_from(plan, &sampler);
         }
-        println!("[{}/{max_iters}]", (i + 1) * polling_frequency);
+        let duration = start.elapsed();
+
+        let duration_ms = duration.as_micros() as f64 / 1000.0;
+        samples.push(BenchSample {
+            iters: (i + 1) * polling_frequency,
+            state_count: plan.state_count(),
+            duration_ms,
+            iters_per_ms: polling_frequency as f64 / duration_ms,
+        });
+    }
+
+    let mut writer = csv::Writer::from_path("rrt_benchmark.csv").unwrap();
+    for sample in samples {
+        writer.serialize(sample).unwrap();
     }
 
     println!("done");
@@ -336,6 +359,10 @@ impl<R, S> RRTPlan<R, S> {
         let card = self.world.state_count() as f64;
         let bound = (self.k_factor * card.log2()).ceil() as usize;
         bound.clamp(1, usize::MAX)
+    }
+
+    fn state_count(&self) -> usize {
+        self.world.state_count()
     }
 
     fn print_to_file<P: AsRef<Path>>(&self, path: P) {
