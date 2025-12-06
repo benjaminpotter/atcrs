@@ -1,4 +1,5 @@
 use dubins_paths::DubinsPath;
+use itertools::Itertools;
 use rand::{Rng, SeedableRng, rngs::SmallRng};
 use std::{
     f64::consts::{E, PI},
@@ -192,17 +193,20 @@ impl World {
 
     // TODO: THIS IS SUPER SLOW...
     pub fn k_nearest(&self, state: &State, k: usize) -> Vec<usize> {
-        let mut distances: Vec<_> = self
-            .vertices
+        // let mut distances: Vec<_> =
+        self.vertices
             .iter()
             .enumerate()
             .map(|(i, v)| (i, v.state.dist(state)))
-            .collect();
+            .k_smallest_by(k, |(_ia, da), (_ib, db)| {
+                da.partial_cmp(&db).expect("distances are well-ordered")
+            })
+            .map(|(i, _dist)| i)
+            .collect()
 
-        distances.sort_by(|a, b| a.1.partial_cmp(&b.1).expect("distances are well-ordered"));
-        distances.truncate(k);
-
-        distances.into_iter().map(|(i, _dist)| i).collect()
+        // distances.sort_by(|a, b| a.1.partial_cmp(&b.1).expect("distances are well-ordered"));
+        // distances.truncate(k);
+        // distances.into_iter().map(|(i, _dist)| i).collect()
     }
 }
 
