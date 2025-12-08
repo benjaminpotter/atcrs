@@ -1,8 +1,10 @@
+use clap::Parser;
 use dubins_paths::DubinsPath;
 use radians::Wrap64;
 use std::f64::consts::PI;
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 use std::{
     collections::{BinaryHeap, HashMap, HashSet, VecDeque},
     fs::File,
@@ -11,38 +13,147 @@ use std::{
 };
 use uuid::Uuid;
 
+#[derive(Parser)]
+struct Cli {
+    trial_path: PathBuf,
+    output_path: PathBuf,
+}
+
+#[derive(serde::Deserialize)]
+struct Trial {
+    fa_flight_id: String,
+    initial_enu_east_km: f64,
+    initial_enu_north_km: f64,
+    initial_enu_up_km: f64,
+    initial_bearing: f64,
+    target_enu_east_km: f64,
+    target_enu_north_km: f64,
+    target_enu_up_km: f64,
+    target_bearing: f64,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct Results {
+    elapsed_30s_ms: u128,
+    elapsed_1m_ms: u128,
+    elapsed_3m_ms: u128,
+
+    path_length_30s: f64,
+    path_length_1m: f64,
+    path_length_3m: f64,
+
+    iters_30s: usize,
+    iters_1m: usize,
+    iters_3m: usize,
+
+    states_30s: usize,
+    states_1m: usize,
+    states_3m: usize,
+}
+
+impl Default for Results {
+    fn default() -> Self {
+        Self {
+            elapsed_30s_ms: Default::default(),
+            elapsed_1m_ms: Default::default(),
+            elapsed_3m_ms: Default::default(),
+            path_length_30s: f64::INFINITY,
+            path_length_1m: f64::INFINITY,
+            path_length_3m: f64::INFINITY,
+            iters_30s: Default::default(),
+            iters_1m: Default::default(),
+            iters_3m: Default::default(),
+            states_30s: Default::default(),
+            states_1m: Default::default(),
+            states_3m: Default::default(),
+        }
+    }
+}
+
+impl Results {
+    fn update(
+        mut self,
+        elapsed: Duration,
+        path_length: f64,
+        iters: usize,
+        states: usize,
+    ) -> Results {
+        if elapsed <= Duration::from_secs(30) {
+            self.elapsed_30s_ms = elapsed.as_millis();
+            self.path_length_30s = path_length;
+            self.iters_30s = iters;
+            self.states_30s = states;
+        } else if elapsed <= Duration::from_secs(1 * 60) {
+            self.elapsed_1m_ms = elapsed.as_millis();
+            self.path_length_1m = path_length;
+            self.iters_1m = iters;
+            self.states_1m = states;
+        } else if elapsed <= Duration::from_secs(3 * 60) {
+            self.elapsed_3m_ms = elapsed.as_millis();
+            self.path_length_3m = path_length;
+            self.iters_3m = iters;
+            self.states_3m = states;
+        }
+
+        self
+    }
+}
+
 fn main() {
-    // let start = State::new(-50.0, 0.0, 5.0, 0.0);
-    // let start = State::new(-50.0, 0.0, 5.0, PI * 3.0 / 4.0);
-    let start = State::new(50.0, 0.0, 5.0, PI); // FIXME: Problem
-    // let start = State::new(-50.0, 0.0, 5.0, PI * 3.9 / 4.0);
+    let cli = Cli::parse();
+    let reader = File::open(cli.trial_path).unwrap();
+    let trial: Trial = serde_json::from_reader(reader).unwrap();
+
+    let start = State::new(
+        trial.initial_enu_east_km,
+        trial.initial_enu_north_km,
+        trial.initial_enu_up_km,
+        trial.initial_bearing,
+    );
+
+    let goal = State::new(
+        trial.target_enu_east_km,
+        trial.target_enu_north_km,
+        trial.target_enu_up_km,
+        trial.target_bearing,
+    );
+
     let start_eps = 3.0;
     let eps_delta = 0.02;
     let stop_eps = 1.0;
-    // let max_iters = 2000000;
+
     let planner = ARAPlanner {
-        goal_region: StateRegion {
-            x: -0.5..0.5,
-            y: -0.5..0.5,
-            z: -0.25..0.25,
-            b: -0.125..0.125,
-        },
+        goal_region: StateRegion::from_state(&goal),
     };
 
     let mut plan = planner.create_plan(start);
-    println!("{:#?}", plan);
+    let mut results = Results::default();
 
-    // TODO: Replace with timing logic.
-    for i in 0..1 {
-        // TODO: eps -= eps_delta;
-        plan = planner.plan_from(plan.clone(), start_eps, None);
+    let mut elapsed = Duration::ZERO;
+    let mut eps = start_eps;
+    while eps > stop_eps {
+        let t0 = Instant::now();
+        plan = planner.plan_from(plan, eps, Some(10_000_000));
+        elapsed += t0.elapsed();
 
-        println!("start writing to file");
-        let path = format!("plan.g");
-        // plan.print_to_file(&path);
-        plan.print_solution_to_file(&path);
-        println!("wrote {path}");
+        if elapsed > Duration::from_secs(3 * 60) {
+            break;
+        }
+
+        results = results.update(
+            elapsed,
+            plan.path_length().unwrap_or(f64::INFINITY),
+            plan.iter_count(),
+            plan.state_count(),
+        );
+
+        dbg!(&results);
+
+        eps -= eps_delta;
     }
+
+    let mut writer = csv::Writer::from_path(cli.output_path).unwrap();
+    writer.serialize(results).unwrap();
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -177,6 +288,27 @@ impl State {
 }
 
 impl StateRegion {
+    pub fn from_state(state: &State) -> Self {
+        StateRegion {
+            x: Range {
+                start: state.x - 0.5,
+                end: state.x + 0.5,
+            },
+            y: Range {
+                start: state.y - 0.5,
+                end: state.y + 0.5,
+            },
+            z: Range {
+                start: state.z - 0.25,
+                end: state.z + 0.25,
+            },
+            b: Range {
+                start: state.bearing() - 0.125,
+                end: state.bearing() + 0.125,
+            },
+        }
+    }
+
     pub fn contains(&self, state: &State) -> bool {
         self.x.contains(&state.x)
             && self.y.contains(&state.y)
@@ -204,13 +336,6 @@ impl Weight {
     pub fn from_cost_to_go_and_target(cost_to_go: f64, to: &State, target: &State) -> Self {
         Weight {
             cost_to_go,
-            cost_to_come: Self::cost_to_come(to, target),
-        }
-    }
-
-    pub fn from_states(from: &State, with: &Weight, to: &State, target: &State) -> Self {
-        Weight {
-            cost_to_go: Self::cost_to_go(from, with, to),
             cost_to_come: Self::cost_to_come(to, target),
         }
     }
@@ -683,6 +808,18 @@ impl ARAPlan {
             parent = self.world.parent(&id);
         }
     }
+
+    fn path_length(&self) -> Option<f64> {
+        Some(self.world.weight(&self.goal_id?).cost_to_go)
+    }
+
+    fn iter_count(&self) -> usize {
+        self.iters
+    }
+
+    fn state_count(&self) -> usize {
+        self.world.state_count()
+    }
 }
 
 impl PartialEq for OpenVertex {
@@ -708,41 +845,6 @@ impl Ord for OpenVertex {
 impl PartialOrd for OpenVertex {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.cmp(&other))
-    }
-}
-
-#[test]
-fn distinct_successors() {
-    // No successor corresponds to the same aligned state or id.
-    let start = State::new(-75.0, 0.0, 5.0, 0.0);
-    let target = State::new(0.0, 0.0, 0.0, 0.0);
-    let mut world = World::new(Discretizer {
-        dx: 0.125,
-        dy: 0.125,
-        dz: 0.05,
-        db: 0.05,
-    });
-
-    let weight = Weight::from_cost_to_go_and_target(0., &start, &target);
-    let start_id = world.insert(start, weight);
-
-    let mut ids = HashSet::new();
-    let mut states = HashSet::new();
-
-    ids.insert(start_id);
-    states.insert(world.vertex(&start_id).state.clone());
-
-    for succ in world.successors(&start_id, |from, with, to| {
-        Weight::from_states(from, with, to, &target)
-    }) {
-        let state = &world.vertex(&succ).state;
-
-        println!("{succ}: {state:#?}");
-        assert!(!ids.contains(&succ));
-        assert!(!states.contains(state));
-
-        ids.insert(succ);
-        states.insert(state.clone());
     }
 }
 
