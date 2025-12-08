@@ -219,7 +219,6 @@ impl Weight {
         self.cost_to_go + inflation * self.cost_to_come
     }
 
-    #[inline(never)]
     fn cost_to_come(state: &State, target: &State) -> f64 {
         // TODO: this should be abstracted...
         let q0 = [state.x, state.y, state.bearing()].into();

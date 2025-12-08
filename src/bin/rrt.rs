@@ -26,12 +26,16 @@ fn main() {
     );
     let planner = RRTPlanner::new();
 
+    let max_turn_rate = 0.025;
+    let max_alt_rate = 0.006;
+    let xy_velocity = 0.1;
+    let airplane = Airplane::new(max_turn_rate, max_alt_rate, xy_velocity);
+
     let start = State([-50., 0., 5., 0.]);
     let goal = State([0., 0., 0., 0.]);
-    let mut plan = planner.create_plan(start, goal, 0);
+    let mut plan = planner.create_plan(start, goal, airplane, 0);
 
     let mut samples = Vec::new();
-
     let polling_frequency = 100;
     let outer = max_iters / polling_frequency;
     for i in 0..outer {
@@ -57,8 +61,8 @@ fn main() {
 
     println!("done");
 
-    // plan.print_to_file("rrt_plan.g");
-    plan.print_solution_to_file("rrt_plan.g");
+    plan.print_to_file("rrt_plan.g");
+    // plan.print_solution_to_file("rrt_plan.g");
 }
 
 trait Statelike {
@@ -81,6 +85,49 @@ impl State {
 impl Statelike for State {
     fn dim() -> usize {
         4
+    }
+}
+
+struct Airplane {
+    max_turn_rate: f64,
+    max_alt_rate: f64,
+    xy_velocity: f64,
+    max_curvature: f64,
+}
+
+impl Airplane {
+    fn new(max_turn_rate: f64, max_alt_rate: f64, xy_velocity: f64) -> Self {
+        Self {
+            max_turn_rate,
+            max_alt_rate,
+            xy_velocity,
+            max_curvature: max_turn_rate / xy_velocity,
+        }
+    }
+
+    fn shortest_xy_path(&self, from: &State, to: &State) -> Option<DubinsPath> {
+        let q0 = [from.0[0], from.0[1], from.0[3]].into();
+        let q1 = [to.0[0], to.0[1], to.0[3]].into();
+        DubinsPath::shortest_from(q0, q1, self.max_curvature).ok()
+    }
+
+    fn xy_velocity(&self) -> f64 {
+        self.xy_velocity
+    }
+
+    fn max_alt_rate(&self) -> f64 {
+        self.max_alt_rate
+    }
+
+    fn length_between(&self, from: &State, to: &State) -> Option<(f64, bool)> {
+        let shortest_path = self.shortest_xy_path(from, to)?;
+        let xy_dist = shortest_path.length();
+        let t_min = xy_dist / self.xy_velocity;
+        let max_alt_change = self.max_alt_rate * t_min;
+        let alt_change = from.0[2] - to.0[2];
+        let valid = max_alt_change > alt_change.abs();
+
+        Some((xy_dist.powf(2.) + alt_change.powf(2.), valid))
     }
 }
 
@@ -139,6 +186,11 @@ struct World {
     vertices: Vec<Vertex>,
 }
 
+enum Dir {
+    From,
+    To,
+}
+
 impl World {
     pub fn new(start: State) -> Self {
         let vertices = vec![Vertex {
@@ -192,21 +244,34 @@ impl World {
     }
 
     // TODO: THIS IS SUPER SLOW...
-    pub fn k_nearest(&self, state: &State, k: usize) -> Vec<usize> {
-        // let mut distances: Vec<_> =
+    pub fn k_nearest(
+        &self,
+        airplane: &Airplane,
+        state: &State,
+        dir: Dir,
+        k: usize,
+    ) -> Vec<(usize, (f64, bool))> {
         self.vertices
             .iter()
             .enumerate()
-            .map(|(i, v)| (i, v.state.dist(state)))
-            .k_smallest_by(k, |(_ia, da), (_ib, db)| {
+            // Filter by euclidean distance for performance.
+            .map(|(i, v)| (i, v, v.state.dist(state)))
+            .k_smallest_by(2 * k, |(_, _, da), (_, _, db)| {
                 da.partial_cmp(&db).expect("distances are well-ordered")
             })
-            .map(|(i, _dist)| i)
+            .map(|(i, v, _)| (i, v))
+            .filter_map(|(i, v)| {
+                // We can't fly backwards...
+                let length_between = match dir {
+                    Dir::To => airplane.length_between(&v.state, state),
+                    Dir::From => airplane.length_between(state, &v.state),
+                };
+                Some((i, length_between?))
+            })
+            .k_smallest_by(k, |(_, (da, _)), (_, (db, _))| {
+                da.partial_cmp(&db).expect("distances are well-ordered")
+            })
             .collect()
-
-        // distances.sort_by(|a, b| a.1.partial_cmp(&b.1).expect("distances are well-ordered"));
-        // distances.truncate(k);
-        // distances.into_iter().map(|(i, _dist)| i).collect()
     }
 }
 
@@ -221,6 +286,7 @@ impl RRTPlanner {
         &self,
         start: State,
         goal: State,
+        airplane: Airplane,
         seed: u64,
     ) -> RRTPlan<SmallRng, State> {
         RRTPlan {
@@ -228,6 +294,7 @@ impl RRTPlanner {
             rng: SmallRng::seed_from_u64(seed),
             goal,
             goal_ix: None,
+            airplane,
             k_factor: E * (1. + 1. / State::dim() as f64),
             phan: PhantomData,
         }
@@ -247,7 +314,7 @@ impl RRTPlanner {
             Sample::State(state) => state,
         };
 
-        let nearest_ix = plan.world.k_nearest(&sample, 1)[0];
+        let (nearest_ix, _) = plan.world.k_nearest(&plan.airplane, &sample, Dir::To, 1)[0];
         let nearest_state = plan.world.state(nearest_ix).expect("nearest_ix exists");
 
         // What does it mean to steer?
@@ -257,21 +324,15 @@ impl RRTPlanner {
         // We pick the smallest absolute altitude change between the maximum with our constraints
         // and the change to get to the sample exactly.
 
-        let max_turn_rate = 0.025;
-        let max_alt_rate = 0.006;
-        let xy_velocity = 0.1;
-        let q0 = [nearest_state.0[0], nearest_state.0[1], nearest_state.0[3]].into();
-        let q1 = [sample.0[0], sample.0[1], sample.0[3]].into();
-        let rho = max_turn_rate / xy_velocity;
-        let Ok(shortest_path) = DubinsPath::shortest_from(q0, q1, rho) else {
+        let Some(shortest_path) = plan.airplane.shortest_xy_path(&nearest_state, &sample) else {
             eprintln!("no path exists from nearest to the sample");
 
             // just try a different sample...
             return plan;
         };
         let xy_dist = shortest_path.length();
-        let t_min = xy_dist / xy_velocity;
-        let max_alt_change = max_alt_rate * t_min;
+        let t_min = xy_dist / plan.airplane.xy_velocity();
+        let max_alt_change = plan.airplane.max_alt_rate() * t_min;
         // Clamp the alt_change to prevent us from violating our constraints.
         let alt_change = (nearest_state.0[2] - sample.0[2]).clamp(-max_alt_change, max_alt_change);
         let mut state = sample;
@@ -282,60 +343,64 @@ impl RRTPlanner {
             return plan;
         }
 
-        let k_nearest = plan.world.k_nearest(&state, plan.k_bound());
-
         // Connect this state to the state which provides the lowest cost-to-come.
-        let (parent_ix, cost_to_come) = k_nearest
-            .iter()
-            .map(|ix| {
+        let Some((parent_ix, cost_to_come)) = plan
+            .world
+            // Move to the state from its parents.
+            .k_nearest(&plan.airplane, &state, Dir::To, plan.k_bound())
+            .into_iter()
+            .filter(|(_, (_, valid))| *valid)
+            .map(|(ix, (length_between, _))| {
                 (
                     ix,
                     plan.world
-                        .cost_to_come(*ix)
+                        .cost_to_come(ix)
                         .expect("k_nearest gives valid ids")
-                        + state.dist(plan.world.state(*ix).expect("k_nearest gives valid ids")),
+                        + length_between,
                 )
             })
             .min_by(|(_, a), (_, b)| a.partial_cmp(&b).expect("costs are well-ordered"))
-            .expect("length of k_nearest > 0");
+        else {
+            // No valid parents exist for this state.
+            // Lets try again...
+            return plan;
+        };
 
         let ix = plan.world.insert(state.clone());
-        *plan.world.parent_mut(ix).unwrap() = Some(*parent_ix);
+        *plan.world.parent_mut(ix).unwrap() = Some(parent_ix);
         *plan.world.cost_to_come_mut(ix).unwrap() = cost_to_come;
 
         if is_goal {
+            assert!(plan.goal_ix.is_none());
+            println!("found goal");
             plan.goal_ix = Some(ix);
+
+            // Doesn't make sense to check whether neighbours are better through the goal because
+            // we stop at the goal.
+            return plan;
         }
 
         // Locally optimize...
-        for child_ix in k_nearest.iter().filter(|cix| *cix != parent_ix) {
-            let child_state = plan.world.state(*child_ix).unwrap();
-            let child_cost_to_come = cost_to_come + state.dist(child_state);
-            if plan.world.cost_to_come(*child_ix).unwrap() <= child_cost_to_come {
-                // Already optimal.
-                continue;
-            }
-
+        for (child_ix, (length_between, _)) in plan
+            .world
+            // Move from the state to its neighbours.
+            .k_nearest(&plan.airplane, &state, Dir::From, plan.k_bound())
+            .into_iter()
+            .filter(|(cix, _)| *cix != parent_ix)
             // Check whether this edge violates our constraints.
-            let q0 = [state.0[0], state.0[1], state.0[3]].into();
-            let q1 = [child_state.0[0], child_state.0[1], child_state.0[3]].into();
-            let Ok(shortest_path) = DubinsPath::shortest_from(q0, q1, rho) else {
-                // Failed to find a path; we assume this means this edge violates the motion constraints.
-                continue;
-            };
-            let xy_dist = shortest_path.length();
-            let t_min = xy_dist / xy_velocity;
-            let max_alt_change = max_alt_rate * t_min;
-            let alt_change = state.0[2] - child_state.0[2];
-            if max_alt_change > alt_change.abs() {
-                // This edge violates the motion constraints.
+            // Could fail to find a path; we assume this means this edge violates the motion constraints.
+            .filter(|(_, (_, valid))| *valid)
+        {
+            let child_cost_to_come = cost_to_come + length_between;
+            if plan.world.cost_to_come(child_ix).unwrap() <= child_cost_to_come {
+                // Already optimal.
                 continue;
             }
 
             // We found a better path, which does not violate any constraints, and lets use it.
             // TODO: This API is bad because it would let us set the parent to None.
-            *plan.world.parent_mut(*child_ix).unwrap() = Some(ix);
-            *plan.world.cost_to_come_mut(*child_ix).unwrap() = child_cost_to_come;
+            *plan.world.parent_mut(child_ix).unwrap() = Some(ix);
+            *plan.world.cost_to_come_mut(child_ix).unwrap() = child_cost_to_come;
         }
 
         plan
@@ -347,6 +412,7 @@ struct RRTPlan<R, S> {
     rng: R,
     goal: State,
     goal_ix: Option<usize>,
+    airplane: Airplane,
     k_factor: f64,
     phan: PhantomData<S>,
 }
