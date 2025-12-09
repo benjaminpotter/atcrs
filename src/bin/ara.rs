@@ -2,8 +2,13 @@ use clap::Parser;
 use dubins_paths::DubinsPath;
 use radians::Wrap64;
 use std::f64::consts::PI;
+use std::f64::consts::TAU;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
+use std::sync::mpsc::RecvTimeoutError;
 use std::time::{Duration, Instant};
 use std::{
     collections::{BinaryHeap, HashMap, HashSet, VecDeque},
@@ -42,6 +47,10 @@ struct Results {
     path_length_1m: f64,
     path_length_3m: f64,
 
+    eps_30s: f64,
+    eps_1m: f64,
+    eps_3m: f64,
+
     iters_30s: usize,
     iters_1m: usize,
     iters_3m: usize,
@@ -60,6 +69,9 @@ impl Default for Results {
             path_length_30s: f64::INFINITY,
             path_length_1m: f64::INFINITY,
             path_length_3m: f64::INFINITY,
+            eps_30s: f64::INFINITY,
+            eps_1m: f64::INFINITY,
+            eps_3m: f64::INFINITY,
             iters_30s: Default::default(),
             iters_1m: Default::default(),
             iters_3m: Default::default(),
@@ -75,22 +87,26 @@ impl Results {
         mut self,
         elapsed: Duration,
         path_length: f64,
+        eps: f64,
         iters: usize,
         states: usize,
     ) -> Results {
         if elapsed <= Duration::from_secs(30) {
             self.elapsed_30s_ms = elapsed.as_millis();
             self.path_length_30s = path_length;
+            self.eps_30s = eps;
             self.iters_30s = iters;
             self.states_30s = states;
         } else if elapsed <= Duration::from_secs(1 * 60) {
             self.elapsed_1m_ms = elapsed.as_millis();
             self.path_length_1m = path_length;
+            self.eps_1m = eps;
             self.iters_1m = iters;
             self.states_1m = states;
         } else if elapsed <= Duration::from_secs(3 * 60) {
             self.elapsed_3m_ms = elapsed.as_millis();
             self.path_length_3m = path_length;
+            self.eps_3m = eps;
             self.iters_3m = iters;
             self.states_3m = states;
         }
@@ -121,37 +137,73 @@ fn main() {
     let start_eps = 3.0;
     let eps_delta = 0.02;
     let stop_eps = 1.0;
-
-    let planner = ARAPlanner {
-        goal_region: StateRegion::from_state(&goal),
-    };
+    let goal_region = StateRegion::from_state(&goal);
+    let planner = Arc::new(ARAPlanner { goal_region });
 
     let mut plan = planner.create_plan(start);
     let mut results = Results::default();
 
+    let max_time = Duration::from_secs(3 * 60);
     let mut elapsed = Duration::ZERO;
     let mut eps = start_eps;
-    while eps > stop_eps {
-        let t0 = Instant::now();
-        plan = planner.plan_from(plan, eps, Some(10_000_000));
-        elapsed += t0.elapsed();
+    while plan.suboptimality(eps) > stop_eps {
+        let cancel_flag = Arc::new(AtomicBool::new(false));
 
-        if elapsed > Duration::from_secs(3 * 60) {
-            break;
+        let cancel_flag_worker = cancel_flag.clone();
+        let planner_worker = planner.clone();
+        let handle = std::thread::spawn(move || {
+            let t0 = Instant::now();
+            let next_plan = planner_worker.plan_from(plan, eps, None, cancel_flag_worker);
+            (t0.elapsed(), next_plan)
+        });
+
+        let mut timeout = max_time - elapsed;
+        let polling_time = Duration::from_secs(5);
+        while !handle.is_finished() {
+            let t0 = Instant::now();
+            std::thread::sleep(polling_time);
+
+            timeout = timeout.saturating_sub(t0.elapsed());
+            println!("{}s of {}s", timeout.as_secs(), max_time.as_secs());
+
+            if timeout == Duration::ZERO {
+                println!("cancelling: timeout");
+                cancel_flag.store(true, Ordering::Relaxed);
+                break;
+            }
         }
 
-        results = results.update(
-            elapsed,
-            plan.path_length().unwrap_or(f64::INFINITY),
-            plan.iter_count(),
-            plan.state_count(),
-        );
+        let (duration, next_plan) = handle.join().unwrap();
 
-        dbg!(&results);
+        elapsed += duration;
+        plan = next_plan;
 
-        eps -= eps_delta;
+        if !cancel_flag.load(Ordering::Relaxed) {
+            println!(
+                "improved path in {} seconds ({} seconds total)",
+                duration.as_secs(),
+                elapsed.as_secs()
+            );
+
+            results = results.update(
+                elapsed,
+                plan.path_length().unwrap_or(f64::INFINITY),
+                plan.suboptimality(eps),
+                plan.iter_count(),
+                plan.state_count(),
+            );
+
+            println!("decrement eps");
+            eps -= eps_delta;
+        } else {
+            println!("failed to improve path: timeout");
+            break;
+        }
     }
 
+    // plan.print_to_file("ara_plan.g");
+
+    println!("writing results");
     let mut writer = csv::Writer::from_path(cli.output_path).unwrap();
     writer.serialize(results).unwrap();
 }
@@ -228,8 +280,8 @@ struct World {
 
     // Let's us determine which states can be connected
     airplane: Airplane,
-
     discretizer: Discretizer,
+    bounds: StateRegion,
 }
 
 #[derive(Clone, Debug)]
@@ -256,7 +308,6 @@ struct ARAPlan {
 
     start_id: Uuid,
     goal_id: Option<Uuid>,
-    goal_f_val: f64,
     goal_region: StateRegion,
 
     iters: usize,
@@ -469,6 +520,12 @@ impl World {
             vertices: HashMap::new(),
             ids: HashMap::new(),
             airplane: Airplane::new(),
+            bounds: StateRegion {
+                x: -75.0..75.0,
+                y: -75.0..75.0,
+                z: 0.0..7.0,
+                b: -PI..PI,
+            },
             discretizer,
         }
     }
@@ -540,7 +597,6 @@ impl World {
 
     pub fn walk_from(&self, id: &Uuid) -> Vec<Uuid> {
         let successors = self.vertex(id).successors.clone().unwrap_or_default();
-        assert!(successors.len() == 9 || successors.len() == 0);
         successors
     }
 
@@ -557,12 +613,16 @@ impl World {
             return successors.clone();
         }
 
+        let bounds = self.bounds.clone();
+
         // If the vertex has not had its successor states already computed, then we must compute
         // all of the successors using the motion primitives.
         let successors: Vec<_> = self
             .airplane
             .move_from(&self.discretizer.continuous(&vertex.state))
             .into_iter()
+            // Limit tree expansion to a StateRegion
+            .filter(|state| bounds.contains(&state))
             // If the discretization is more coarse than the motion primitives, we can end up with
             // non-unique successor states.
             // FIXME: Why doesn't the self.id check handle this case?
@@ -595,7 +655,8 @@ impl World {
 
         self.vertex_mut(id).successors = Some(successors.clone());
 
-        assert_eq!(successors.len(), 9);
+        // Not true since we add bounds.
+        // assert_eq!(successors.len(), 9);
 
         successors
     }
@@ -629,7 +690,6 @@ impl ARAPlanner {
             incons_set: HashSet::new(),
             start_id,
             goal_id: None,
-            goal_f_val: f64::INFINITY,
             goal_region: self.goal_region.clone(),
             iters: 0,
         };
@@ -641,7 +701,13 @@ impl ARAPlanner {
         plan
     }
 
-    pub fn plan_from(&self, mut plan: ARAPlan, eps: f64, max_iters: Option<usize>) -> ARAPlan {
+    pub fn plan_from(
+        &self,
+        mut plan: ARAPlan,
+        eps: f64,
+        max_iters: Option<usize>,
+        cancel_flag: Arc<AtomicBool>,
+    ) -> ARAPlan {
         let open_vertices: Vec<_> = plan
             .incons_set
             .drain()
@@ -655,17 +721,18 @@ impl ARAPlanner {
 
         plan.closed_set.clear();
 
-        loop {
+        let mut iters = 0;
+        while !cancel_flag.load(Ordering::Relaxed) {
             if let Some(max) = max_iters {
-                if plan.iters > max {
+                if iters > max {
+                    eprintln!("too many iters!");
                     break;
                 }
             }
 
-            let id = plan.pop();
-            if plan.goal_f_val <= plan.world.weight(&id).cost(eps) {
+            let Some(id) = plan.pop() else {
                 break;
-            }
+            };
 
             let state = plan.world.state(&id);
             let weight = plan.world.weight(&id).clone();
@@ -674,15 +741,25 @@ impl ARAPlanner {
             if plan.goal_id.is_none() {
                 if plan.goal_region.contains(&state) {
                     println!("found goal region");
-                    plan.goal_f_val = weight.cost(eps);
                     plan.goal_id = Some(id);
                 }
             }
+
+            let goal_f_val = match plan.goal_id {
+                Some(id) => plan.world.weight(&id).cost(eps),
+                None => f64::INFINITY,
+            };
+
+            if goal_f_val <= weight.cost(eps) {
+                break;
+            }
+
             let successors = plan.world.successors(&id, |state| {
                 Weight::from_cost_to_go_and_target(f64::INFINITY, state, &self.goal_region.center())
             });
 
-            assert_eq!(successors.len(), 9);
+            // Not true since we added bounds.
+            // assert_eq!(successors.len(), 9);
 
             for succ in successors {
                 let succ_state = plan.world.state(&succ);
@@ -709,9 +786,10 @@ impl ARAPlanner {
                 }
             }
 
-            plan.iters += 1;
+            iters += 1;
         }
 
+        plan.iters += iters;
         plan
     }
 }
@@ -733,15 +811,28 @@ impl ARAPlan {
         self.incons_set.insert(id);
     }
 
-    fn suboptimality(&self) -> f64 {
-        // TODO: actually implement this
-        10.0
+    fn suboptimality(&self, eps: f64) -> f64 {
+        let g_goal = match self.goal_id {
+            Some(id) => self.world.weight(&id).cost_to_go,
+            None => f64::INFINITY,
+        };
+
+        let min_f = self
+            .open_set
+            .iter()
+            .map(|ov| &ov.id)
+            .chain(self.incons_set.iter())
+            .map(|id| self.world.weight(id).cost(1.))
+            .min_by(|a, b| a.partial_cmp(&b).unwrap())
+            .unwrap();
+
+        eps.min(g_goal / min_f)
     }
 
-    fn pop(&mut self) -> Uuid {
-        let id = self.open_set.pop().expect("the open set is never empty").id;
+    fn pop(&mut self) -> Option<Uuid> {
+        let id = self.open_set.pop()?.id;
         self.close(id);
-        id
+        Some(id)
     }
 
     fn print_to_file<P: AsRef<Path>>(&self, path: P) {
