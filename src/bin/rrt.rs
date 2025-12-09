@@ -1,13 +1,14 @@
+use clap::Parser;
 use dubins_paths::DubinsPath;
 use itertools::Itertools;
-use rand::{Rng, SeedableRng, rngs::SmallRng};
+use rand::Rng;
 use std::{
     f64::consts::{E, PI},
     fs::File,
     io::{BufWriter, Write},
     marker::PhantomData,
-    path::Path,
-    time::Instant,
+    path::{Path, PathBuf},
+    time::{Duration, Instant},
 };
 
 #[derive(serde::Serialize)]
@@ -18,51 +19,152 @@ struct BenchSample {
     iters_per_ms: f64,
 }
 
+#[derive(Parser)]
+struct Cli {
+    trial_path: PathBuf,
+    output_path: PathBuf,
+}
+
+#[derive(serde::Deserialize)]
+struct Trial {
+    fa_flight_id: String,
+    initial_enu_east_km: f64,
+    initial_enu_north_km: f64,
+    initial_enu_up_km: f64,
+    initial_bearing: f64,
+    target_enu_east_km: f64,
+    target_enu_north_km: f64,
+    target_enu_up_km: f64,
+    target_bearing: f64,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct Results {
+    elapsed_30s_ms: u128,
+    elapsed_1m_ms: u128,
+    elapsed_3m_ms: u128,
+
+    path_length_30s: f64,
+    path_length_1m: f64,
+    path_length_3m: f64,
+
+    iters_30s: usize,
+    iters_1m: usize,
+    iters_3m: usize,
+
+    states_30s: usize,
+    states_1m: usize,
+    states_3m: usize,
+}
+
+impl Results {
+    fn update(
+        mut self,
+        elapsed: Duration,
+        path_length: f64,
+        iters: usize,
+        states: usize,
+    ) -> Results {
+        if elapsed <= Duration::from_secs(30) {
+            self.elapsed_30s_ms = elapsed.as_millis();
+            self.path_length_30s = path_length;
+            self.iters_30s = iters;
+            self.states_30s = states;
+        } else if elapsed <= Duration::from_secs(1 * 60) {
+            self.elapsed_1m_ms = elapsed.as_millis();
+            self.path_length_1m = path_length;
+            self.iters_1m = iters;
+            self.states_1m = states;
+        } else if elapsed <= Duration::from_secs(3 * 60) {
+            self.elapsed_3m_ms = elapsed.as_millis();
+            self.path_length_3m = path_length;
+            self.iters_3m = iters;
+            self.states_3m = states;
+        }
+
+        self
+    }
+}
+
+impl Default for Results {
+    fn default() -> Self {
+        Self {
+            elapsed_30s_ms: Default::default(),
+            elapsed_1m_ms: Default::default(),
+            elapsed_3m_ms: Default::default(),
+            path_length_30s: f64::INFINITY,
+            path_length_1m: f64::INFINITY,
+            path_length_3m: f64::INFINITY,
+            iters_30s: Default::default(),
+            iters_1m: Default::default(),
+            iters_3m: Default::default(),
+            states_30s: Default::default(),
+            states_1m: Default::default(),
+            states_3m: Default::default(),
+        }
+    }
+}
+
 fn main() {
-    let max_iters = 10_000;
+    let cli = Cli::parse();
+    let reader = File::open(cli.trial_path).unwrap();
+    let trial: Trial = serde_json::from_reader(reader).unwrap();
+
     let sampler = Sampler::new(
-        (State([-75., -75., 0., 0.]), State([75., 75., 7., 2. * PI])),
-        0.01,
+        // TODO: Do I need to handle angle wrapping?
+        // (State([-75., -75., 0., 0.]), State([75., 75., 7., 2. * PI])),
+        (State([-75., -75., 0., -PI]), State([75., 75., 7., PI])),
+        0.1,
     );
-    let planner = RRTPlanner::new();
 
     let max_turn_rate = 0.025;
     let max_alt_rate = 0.006;
     let xy_velocity = 0.1;
     let airplane = Airplane::new(max_turn_rate, max_alt_rate, xy_velocity);
 
-    let start = State([-50., 0., 5., 0.]);
-    let goal = State([0., 0., 0., 0.]);
-    let mut plan = planner.create_plan(start, goal, airplane, 0);
+    let start = State([
+        trial.initial_enu_east_km,
+        trial.initial_enu_north_km,
+        trial.initial_enu_up_km,
+        trial.initial_bearing,
+    ]);
 
-    let mut samples = Vec::new();
-    let polling_frequency = 100;
-    let outer = max_iters / polling_frequency;
-    for i in 0..outer {
+    let goal = State([
+        trial.target_enu_east_km,
+        trial.target_enu_north_km,
+        trial.target_enu_up_km,
+        trial.target_bearing,
+    ]);
+
+    let planner = RRTPlanner::new();
+    let mut plan = planner.create_plan(start, goal, airplane, rand::rng());
+    let mut results = Results::default();
+
+    let poll_after = 1000;
+    let timeout = Duration::from_secs(3 * 60);
+    let mut elapsed = Duration::ZERO;
+
+    while elapsed < timeout {
         let start = Instant::now();
-        for _ in 0..polling_frequency {
+        for _ in 0..poll_after {
             plan = planner.plan_from(plan, &sampler);
         }
         let duration = start.elapsed();
+        elapsed += duration;
 
-        let duration_ms = duration.as_micros() as f64 / 1000.0;
-        samples.push(BenchSample {
-            iters: (i + 1) * polling_frequency,
-            state_count: plan.state_count(),
-            duration_ms,
-            iters_per_ms: polling_frequency as f64 / duration_ms,
-        });
+        println!("{} of {}", elapsed.as_secs(), timeout.as_secs());
+        results = results.update(
+            elapsed,
+            plan.path_length(),
+            plan.iter_count(),
+            plan.state_count(),
+        );
     }
 
-    let mut writer = csv::Writer::from_path("rrt_benchmark.csv").unwrap();
-    for sample in samples {
-        writer.serialize(sample).unwrap();
-    }
-
-    println!("done");
-
-    plan.print_to_file("rrt_plan.g");
+    // plan.print_to_file("rrt_plan.g");
     // plan.print_solution_to_file("rrt_plan.g");
+    let mut writer = csv::Writer::from_path(cli.output_path).unwrap();
+    writer.serialize(results).unwrap();
 }
 
 trait Statelike {
@@ -89,7 +191,7 @@ impl Statelike for State {
 }
 
 struct Airplane {
-    max_turn_rate: f64,
+    //max_turn_rate: f64,
     max_alt_rate: f64,
     xy_velocity: f64,
     max_curvature: f64,
@@ -98,7 +200,7 @@ struct Airplane {
 impl Airplane {
     fn new(max_turn_rate: f64, max_alt_rate: f64, xy_velocity: f64) -> Self {
         Self {
-            max_turn_rate,
+            //        max_turn_rate,
             max_alt_rate,
             xy_velocity,
             max_curvature: max_turn_rate / xy_velocity,
@@ -169,7 +271,7 @@ impl Sampler {
 
     fn sample<R: Rng>(&self, rng: &mut R) -> Sample {
         if !rng.random_bool(self.goal_sampling_chance) {
-            let mut state = [
+            let state = [
                 rng.random_range(self.min.0[0]..self.max.0[0]),
                 rng.random_range(self.min.0[1]..self.max.0[1]),
                 rng.random_range(self.min.0[2]..self.max.0[2]),
@@ -243,7 +345,6 @@ impl World {
         self.vertices.len()
     }
 
-    // TODO: THIS IS SUPER SLOW...
     pub fn k_nearest(
         &self,
         airplane: &Airplane,
@@ -282,29 +383,32 @@ impl RRTPlanner {
         Self {}
     }
 
-    pub fn create_plan<'a>(
+    pub fn create_plan<R: Rng>(
         &self,
         start: State,
         goal: State,
         airplane: Airplane,
-        seed: u64,
-    ) -> RRTPlan<SmallRng, State> {
+        rng: R,
+    ) -> RRTPlan<R, State> {
         RRTPlan {
             world: World::new(start),
-            rng: SmallRng::seed_from_u64(seed),
+            rng,
             goal,
             goal_ix: None,
             airplane,
+            iters: 0,
             k_factor: E * (1. + 1. / State::dim() as f64),
             phan: PhantomData,
         }
     }
 
-    pub fn plan_from(
+    pub fn plan_from<R: Rng>(
         &self,
-        mut plan: RRTPlan<SmallRng, State>,
+        mut plan: RRTPlan<R, State>,
         sampler: &Sampler,
-    ) -> RRTPlan<SmallRng, State> {
+    ) -> RRTPlan<R, State> {
+        plan.iters += 1;
+
         let mut is_goal = false;
         let sample = match sampler.sample(plan.rng()) {
             Sample::Goal => {
@@ -366,19 +470,29 @@ impl RRTPlanner {
             return plan;
         };
 
-        let ix = plan.world.insert(state.clone());
+        let ix = if !is_goal {
+            // We didn't sample the goal.
+            // - Insert
+            // - Return ix
+            plan.world.insert(state.clone())
+        } else if let Some(ix) = plan.goal_ix {
+            // We sampled the goal and we have done so before.
+            //  - Return goal_ix
+            ix
+        } else {
+            // We sampled the goal and we have not done so before.
+            //  - Insert
+            //  - Set goal_ix
+            //  - Return goal_ix
+            println!("found goal");
+
+            let ix = plan.world.insert(state.clone());
+            plan.goal_ix = Some(ix);
+            ix
+        };
+
         *plan.world.parent_mut(ix).unwrap() = Some(parent_ix);
         *plan.world.cost_to_come_mut(ix).unwrap() = cost_to_come;
-
-        if is_goal {
-            assert!(plan.goal_ix.is_none());
-            println!("found goal");
-            plan.goal_ix = Some(ix);
-
-            // Doesn't make sense to check whether neighbours are better through the goal because
-            // we stop at the goal.
-            return plan;
-        }
 
         // Locally optimize...
         for (child_ix, (length_between, _)) in plan
@@ -413,6 +527,7 @@ struct RRTPlan<R, S> {
     goal: State,
     goal_ix: Option<usize>,
     airplane: Airplane,
+    iters: usize,
     k_factor: f64,
     phan: PhantomData<S>,
 }
@@ -486,5 +601,16 @@ impl<R, S> RRTPlan<R, S> {
             let _ = writeln!(writer, "e {} {}", parent_ix, ix);
             ix = parent_ix;
         }
+    }
+
+    fn path_length(&self) -> f64 {
+        match self.goal_ix {
+            Some(ix) => self.world.cost_to_come(ix).unwrap(),
+            None => f64::INFINITY,
+        }
+    }
+
+    fn iter_count(&self) -> usize {
+        self.iters
     }
 }
