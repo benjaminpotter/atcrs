@@ -229,7 +229,7 @@ impl Airplane {
         let alt_change = from.0[2] - to.0[2];
         let valid = max_alt_change > alt_change.abs();
 
-        Some((xy_dist.powf(2.) + alt_change.powf(2.), valid))
+        Some(((xy_dist.powf(2.) + alt_change.powf(2.)).sqrt(), valid))
     }
 }
 
