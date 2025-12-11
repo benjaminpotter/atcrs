@@ -117,7 +117,7 @@ fn main() {
         0.1,
     );
 
-    let max_turn_rate = 0.025;
+    let max_turn_rate = 0.025; // 0.025 * 30 = 0.75 radians
     let max_alt_rate = 0.006;
     let xy_velocity = 0.1;
     let airplane = Airplane::new(max_turn_rate, max_alt_rate, xy_velocity);
@@ -194,23 +194,22 @@ struct Airplane {
     //max_turn_rate: f64,
     max_alt_rate: f64,
     xy_velocity: f64,
-    max_curvature: f64,
+    turn_radius: f64,
 }
 
 impl Airplane {
     fn new(max_turn_rate: f64, max_alt_rate: f64, xy_velocity: f64) -> Self {
         Self {
-            //        max_turn_rate,
             max_alt_rate,
             xy_velocity,
-            max_curvature: max_turn_rate / xy_velocity,
+            turn_radius: xy_velocity / max_turn_rate,
         }
     }
 
     fn shortest_xy_path(&self, from: &State, to: &State) -> Option<DubinsPath> {
         let q0 = [from.0[0], from.0[1], from.0[3]].into();
         let q1 = [to.0[0], to.0[1], to.0[3]].into();
-        DubinsPath::shortest_from(q0, q1, self.max_curvature).ok()
+        DubinsPath::shortest_from(q0, q1, self.turn_radius).ok()
     }
 
     fn xy_velocity(&self) -> f64 {
@@ -230,6 +229,27 @@ impl Airplane {
         let valid = max_alt_change > alt_change.abs();
 
         Some(((xy_dist.powf(2.) + alt_change.powf(2.)).sqrt(), valid))
+    }
+
+    // Makes no guarantees about the constraints on the path between from and to.
+    fn subdivide(&self, from: &State, to: &State, every: Duration) -> Vec<State> {
+        let Some(shortest_path) = self.shortest_xy_path(from, to) else {
+            return Vec::new();
+        };
+
+        let step_distance = self.xy_velocity * every.as_secs() as f64;
+        let total_alt_change = to.0[2] - from.0[2];
+
+        // Use similar triangles...
+        let edge_ratio = total_alt_change / shortest_path.length();
+
+        shortest_path
+            .sample_many(step_distance)
+            .into_iter()
+            .enumerate()
+            .map(|(i, sample)| (step_distance * edge_ratio * (i as f64), sample))
+            .map(|(dz, sample)| State([sample.x(), sample.y(), from.0[2] + dz, sample.rot()]))
+            .collect()
     }
 }
 
@@ -438,9 +458,10 @@ impl RRTPlanner {
         let t_min = xy_dist / plan.airplane.xy_velocity();
         let max_alt_change = plan.airplane.max_alt_rate() * t_min;
         // Clamp the alt_change to prevent us from violating our constraints.
-        let alt_change = (nearest_state.0[2] - sample.0[2]).clamp(-max_alt_change, max_alt_change);
+        // let alt_change = (nearest_state.0[2] - sample.0[2]).clamp(-max_alt_change, max_alt_change);
+        let alt_change = (sample.0[2] - nearest_state.0[2]).clamp(-max_alt_change, max_alt_change);
         let mut state = sample;
-        state.0[2] += alt_change;
+        state.0[2] = nearest_state.0[2] + alt_change;
 
         if is_goal && plan.goal_ix.is_some() {
             // Already found the goal.
@@ -583,23 +604,46 @@ impl<R, S> RRTPlan<R, S> {
         let mut writer = BufWriter::new(file);
         // let mut writer = std::io::stdout();
 
+        let mut vertices = Vec::new();
+
         let mut ix = goal_ix;
         loop {
             let state = self.world.state(ix).unwrap();
             let cost_to_come = self.world.cost_to_come(ix).unwrap();
+            let parent = self.world.parent(ix).unwrap();
+            vertices.push((state.clone(), cost_to_come, true));
 
+            if let Some(parent_ix) = parent {
+                // Insert vertices along the path...
+                let parent_state = self.world.state(parent_ix).unwrap();
+                let substates =
+                    self.airplane
+                        .subdivide(parent_state, state, Duration::from_secs(5));
+
+                // Need to remove the first and last from the list because these will be added as
+                // original states...
+                let len_between = substates.len().saturating_sub(2);
+                for substate in substates.into_iter().skip(1).take(len_between).rev() {
+                    vertices.push((substate, cost_to_come, false));
+                }
+
+                ix = parent_ix;
+            } else {
+                break;
+            }
+        }
+
+        for (ix, (state, cost_to_come, original)) in vertices.iter().enumerate() {
             let _ = writeln!(
                 writer,
-                "v {} {:.2} {:.2} {:.2} {:.2} {:.2} {:.2}",
-                ix, state.0[0], state.0[1], state.0[2], state.0[3], cost_to_come, 0.,
+                "v {} {:.2} {:.2} {:.2} {:.2} {:.2} {:.2} {}",
+                ix, state.0[0], state.0[1], state.0[2], state.0[3], cost_to_come, 0., original
             );
 
-            let Some(parent_ix) = self.world.parent(ix).unwrap() else {
-                break;
-            };
-
-            let _ = writeln!(writer, "e {} {}", parent_ix, ix);
-            ix = parent_ix;
+            let parent_ix = ix + 1;
+            if parent_ix < vertices.len() {
+                let _ = writeln!(writer, "e {} {}", parent_ix, ix);
+            }
         }
     }
 
@@ -613,4 +657,24 @@ impl<R, S> RRTPlan<R, S> {
     fn iter_count(&self) -> usize {
         self.iters
     }
+}
+
+#[test]
+fn test_subdivide() {
+    let from = State([56.57, 47.70, 3.37, -2.83]);
+    let to = State([-0.45, 2.94, 0.97, -1.58]);
+
+    let max_turn_rate = 0.025;
+    let max_alt_rate = 0.006;
+    let xy_velocity = 0.1;
+
+    dbg!(
+        Airplane::new(max_turn_rate, max_alt_rate, xy_velocity)
+            .subdivide(&from, &to, Duration::from_secs(5),)
+            .into_iter()
+            .map(|state| state.0[3])
+            .collect::<Vec<_>>()
+    );
+
+    panic!()
 }

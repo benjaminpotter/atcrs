@@ -202,6 +202,7 @@ fn main() {
     }
 
     // plan.print_to_file("ara_plan.g");
+    // plan.print_solution_to_file("ara_plan.g");
 
     println!("writing results");
     let mut writer = csv::Writer::from_path(cli.output_path).unwrap();
@@ -381,7 +382,7 @@ impl StateRegion {
     }
 }
 
-const RHO: f64 = D_B / V;
+const RHO: f64 = V / D_B;
 
 impl Weight {
     pub fn from_cost_to_go_and_target(cost_to_go: f64, to: &State, target: &State) -> Self {
@@ -886,7 +887,7 @@ impl ARAPlan {
             let weight = self.world.weight(&id);
             let _ = writeln!(
                 writer,
-                "v {} {:.2} {:.2} {:.2} {:.2} {:.2} {:.2}",
+                "v {} {:.2} {:.2} {:.2} {:.2} {:.2} {:.2} {}",
                 id,
                 state.x,
                 state.y,
@@ -894,6 +895,7 @@ impl ARAPlan {
                 state.bearing(),
                 weight.cost_to_go,
                 weight.cost_to_come,
+                true
             );
 
             parent = self.world.parent(&id);
