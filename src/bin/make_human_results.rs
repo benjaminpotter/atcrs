@@ -151,11 +151,11 @@ fn ecld(s0: &[f64; 4], s1: &[f64; 4]) -> f64 {
 fn dbns(s0: &[f64; 4], s1: &[f64; 4]) -> f64 {
     let max_turn_rate = 0.025;
     let xy_velocity = 0.1;
-    let max_curvature = max_turn_rate / xy_velocity;
+    let turn_radius = xy_velocity / max_turn_rate;
 
     let q0 = [s0[0], s0[1], s0[3]].into();
     let q1 = [s1[0], s1[1], s1[3]].into();
-    let shortest_path = DubinsPath::shortest_from(q0, q1, max_curvature).unwrap();
+    let shortest_path = DubinsPath::shortest_from(q0, q1, turn_radius).unwrap();
     let xy_dist = shortest_path.length();
     let alt_change = s0[2] - s1[2];
 
