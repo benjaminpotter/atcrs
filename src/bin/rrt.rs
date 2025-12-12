@@ -162,7 +162,7 @@ fn main() {
     }
 
     // plan.print_to_file("rrt_plan.g");
-    // plan.print_solution_to_file("rrt_plan.g");
+    plan.print_solution_to_file("rrt_plan.g");
     let mut writer = csv::Writer::from_path(cli.output_path).unwrap();
     writer.serialize(results).unwrap();
 }
@@ -454,14 +454,20 @@ impl RRTPlanner {
             // just try a different sample...
             return plan;
         };
-        let xy_dist = shortest_path.length();
-        let t_min = xy_dist / plan.airplane.xy_velocity();
-        let max_alt_change = plan.airplane.max_alt_rate() * t_min;
+
+        let d = shortest_path
+            .length()
+            .min(plan.airplane.xy_velocity() * 30.0);
+        let xyb = shortest_path.sample(d);
+
         // Clamp the alt_change to prevent us from violating our constraints.
         // let alt_change = (nearest_state.0[2] - sample.0[2]).clamp(-max_alt_change, max_alt_change);
+        let t = d / plan.airplane.xy_velocity();
+        let max_alt_change = plan.airplane.max_alt_rate() * t;
         let alt_change = (sample.0[2] - nearest_state.0[2]).clamp(-max_alt_change, max_alt_change);
-        let mut state = sample;
-        state.0[2] = nearest_state.0[2] + alt_change;
+
+        let z = nearest_state.0[2] + alt_change;
+        let state = State([xyb.x(), xyb.y(), z, xyb.rot()]);
 
         if is_goal && plan.goal_ix.is_some() {
             // Already found the goal.
