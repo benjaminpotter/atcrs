@@ -1,14 +1,13 @@
+use atcrs::PenaltyMap;
 use clap::Parser;
 use dubins_paths::DubinsPath;
 use radians::Wrap64;
 use std::f64::consts::PI;
-use std::f64::consts::TAU;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
-use std::sync::mpsc::RecvTimeoutError;
 use std::time::{Duration, Instant};
 use std::{
     collections::{BinaryHeap, HashMap, HashSet, VecDeque},
@@ -21,6 +20,7 @@ use uuid::Uuid;
 #[derive(Parser)]
 struct Cli {
     trial_path: PathBuf,
+    penalty_path: PathBuf,
     output_path: PathBuf,
 }
 
@@ -139,6 +139,7 @@ fn main() {
     let stop_eps = 1.0;
     let goal_region = StateRegion::from_state(&goal);
     let planner = Arc::new(ARAPlanner { goal_region });
+    let penalty = Arc::new(PenaltyMap::from_path(cli.penalty_path).unwrap());
 
     let mut plan = planner.create_plan(start);
     let mut results = Results::default();
@@ -151,9 +152,11 @@ fn main() {
 
         let cancel_flag_worker = cancel_flag.clone();
         let planner_worker = planner.clone();
+        let penalty_worker = penalty.clone();
         let handle = std::thread::spawn(move || {
             let t0 = Instant::now();
-            let next_plan = planner_worker.plan_from(plan, eps, None, cancel_flag_worker);
+            let next_plan =
+                planner_worker.plan_from(plan, eps, &penalty_worker, None, cancel_flag_worker);
             (t0.elapsed(), next_plan)
         });
 
@@ -229,8 +232,10 @@ struct StateRegion {
 
 #[derive(Clone, Debug)]
 struct Weight {
-    cost_to_go: f64,
+    // g
     cost_to_come: f64,
+    // f
+    cost_to_go: f64,
 }
 
 #[derive(Clone, Debug)]
@@ -385,18 +390,18 @@ impl StateRegion {
 const RHO: f64 = V / D_B;
 
 impl Weight {
-    pub fn from_cost_to_go_and_target(cost_to_go: f64, to: &State, target: &State) -> Self {
+    pub fn from_cost_to_come_and_target(cost_to_come: f64, to: &State, target: &State) -> Self {
         Weight {
-            cost_to_go,
-            cost_to_come: Self::cost_to_come(to, target),
+            cost_to_come,
+            cost_to_go: Self::cost_to_go(to, target),
         }
     }
 
     pub fn cost(&self, inflation: f64) -> f64 {
-        self.cost_to_go + inflation * self.cost_to_come
+        self.cost_to_come + inflation * self.cost_to_go
     }
 
-    fn cost_to_come(state: &State, target: &State) -> f64 {
+    fn cost_to_go(state: &State, target: &State) -> f64 {
         // TODO: this should be abstracted...
         let q0 = [state.x, state.y, state.bearing()].into();
         let q1 = [target.x, target.y, target.bearing()].into();
@@ -411,8 +416,8 @@ impl Weight {
         ((V * t_min).powf(2.) + (state.z - target.z).powf(2.)).sqrt()
     }
 
-    fn cost_to_go(from: &State, with: &Weight, to: &State) -> f64 {
-        with.cost_to_go + from.euclidean_dist_to(&to)
+    fn cost_to_come(from: &State, with: &Weight, to: &State, penalty: f64) -> f64 {
+        with.cost_to_come + (from.euclidean_dist_to(&to) * penalty)
     }
 }
 
@@ -681,7 +686,7 @@ impl ARAPlanner {
             db: 0.05,
         });
 
-        let weight = Weight::from_cost_to_go_and_target(0., &start, &self.goal_region.center());
+        let weight = Weight::from_cost_to_come_and_target(0., &start, &self.goal_region.center());
         let start_id = world.insert(start, weight, None).clone();
 
         let mut plan = ARAPlan {
@@ -706,6 +711,7 @@ impl ARAPlanner {
         &self,
         mut plan: ARAPlan,
         eps: f64,
+        penalty_map: &PenaltyMap,
         max_iters: Option<usize>,
         cancel_flag: Arc<AtomicBool>,
     ) -> ARAPlan {
@@ -756,7 +762,11 @@ impl ARAPlanner {
             }
 
             let successors = plan.world.successors(&id, |state| {
-                Weight::from_cost_to_go_and_target(f64::INFINITY, state, &self.goal_region.center())
+                Weight::from_cost_to_come_and_target(
+                    f64::INFINITY,
+                    state,
+                    &self.goal_region.center(),
+                )
             });
 
             // Not true since we added bounds.
@@ -766,12 +776,18 @@ impl ARAPlanner {
                 let succ_state = plan.world.state(&succ);
                 let succ_weight = plan.world.weight_mut(&succ);
                 let cost = succ_weight.cost(eps);
-                let cost_to_go = Weight::cost_to_go(&state, &weight, &succ_state);
+                let penalty = penalty_map.penalty(&[
+                    succ_state.x,
+                    succ_state.y,
+                    succ_state.z,
+                    succ_state.bearing(),
+                ]);
+                let cost_to_come = Weight::cost_to_come(&state, &weight, &succ_state, penalty);
 
                 // if succ is better through s then
-                if cost_to_go < succ_weight.cost_to_go {
+                if cost_to_come < succ_weight.cost_to_come {
                     // update its g value
-                    succ_weight.cost_to_go = cost_to_go;
+                    succ_weight.cost_to_come = cost_to_come;
 
                     // set this as the parent
                     *plan.world.parent_mut(&succ) = Some(id);
@@ -814,7 +830,7 @@ impl ARAPlan {
 
     fn suboptimality(&self, eps: f64) -> f64 {
         let g_goal = match self.goal_id {
-            Some(id) => self.world.weight(&id).cost_to_go,
+            Some(id) => self.world.weight(&id).cost_to_come,
             None => f64::INFINITY,
         };
 
@@ -864,8 +880,8 @@ impl ARAPlan {
                 state.y,
                 state.z,
                 state.bearing(),
-                weight.cost_to_go,
                 weight.cost_to_come,
+                weight.cost_to_go,
             );
 
             for succ in self.world.walk_from(&id) {
@@ -893,8 +909,8 @@ impl ARAPlan {
                 state.y,
                 state.z,
                 state.bearing(),
-                weight.cost_to_go,
                 weight.cost_to_come,
+                weight.cost_to_go,
                 true
             );
 
@@ -903,7 +919,7 @@ impl ARAPlan {
     }
 
     fn path_length(&self) -> Option<f64> {
-        Some(self.world.weight(&self.goal_id?).cost_to_go)
+        Some(self.world.weight(&self.goal_id?).cost_to_come)
     }
 
     fn iter_count(&self) -> usize {
@@ -982,3 +998,13 @@ fn vertex_ordering() {
         }
     );
 }
+
+// #[test]
+// fn avg_distance() {
+//     let airplane = Airplane::new();
+//     let from = State::new(0., 0., 0., 0.);
+//     let tos = airplane.move_from(&from);
+//     let sum: f64 = tos.iter().map(|to| from.euclidean_dist_to(&to)).sum();
+//     println!("{}", sum / tos.len() as f64);
+//     panic!()
+// }
