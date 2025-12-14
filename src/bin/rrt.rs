@@ -113,10 +113,8 @@ fn main() {
     let trial: Trial = serde_json::from_reader(reader).unwrap();
 
     let sampler = Sampler::new(
-        // TODO: Do I need to handle angle wrapping?
-        // (State([-75., -75., 0., 0.]), State([75., 75., 7., 2. * PI])),
         (State([-75., -75., 0., 0.]), State([75., 75., 4., TAU])),
-        0.3,
+        0.1,
     );
 
     let max_turn_rate = 0.025; // 0.025 * 30 = 0.75 radians
@@ -442,8 +440,12 @@ impl RRTPlanner {
     ) -> RRTPlan<R, State> {
         plan.iters += 1;
 
+        let mut sample_goal = false;
         let sample = match sampler.sample(plan.rng()) {
-            Sample::Goal => plan.goal.center().clone(),
+            Sample::Goal => {
+                sample_goal = true;
+                plan.goal.center().clone()
+            }
             Sample::State(state) => state,
         };
 
@@ -464,9 +466,9 @@ impl RRTPlanner {
             return plan;
         };
 
-        let d = shortest_path
-            .length()
-            .min(plan.airplane.xy_velocity() * 30.0);
+        let d_max = shortest_path.length();
+        let d_steer = plan.airplane.xy_velocity() * 180.0;
+        let d = d_max.min(d_steer);
         let xyb = shortest_path.sample(d);
 
         // Clamp the alt_change to prevent us from violating our constraints.
@@ -498,7 +500,7 @@ impl RRTPlanner {
         else {
             // No valid parents exist for this state.
             // Lets try again...
-            // eprintln!("no valid parents for state");
+            eprintln!("no valid parents for state (sample goal: {})", sample_goal);
             return plan;
         };
 
@@ -507,6 +509,13 @@ impl RRTPlanner {
 
         // We didn't sample the goal.
         // - Insert
+
+        // if !is_goal && sample_goal {
+        //     println!(
+        //         "sampled goal but didn't reach it: ({:.0}% of d_max)",
+        //         d / d_max * 100.
+        //     );
+        // }
 
         if is_goal {
             // We sampled the goal.
@@ -565,6 +574,10 @@ impl StateRegion {
         let xy = 0.5;
         let z = 0.25;
         let b = 0.125;
+
+        // let xy = 1.;
+        // let z = 0.5;
+        // let b = 0.25;
 
         let start = (center.0[3] - b).rem_euclid(TAU);
         let end = (center.0[3] + b).rem_euclid(TAU);
