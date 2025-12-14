@@ -1,12 +1,14 @@
 use clap::Parser;
 use dubins_paths::DubinsPath;
 use itertools::Itertools;
+use kdtree::{KdTree, distance::squared_euclidean};
 use rand::Rng;
 use std::{
-    f64::consts::{E, PI},
+    f64::consts::{E, PI, TAU},
     fs::File,
     io::{BufWriter, Write},
     marker::PhantomData,
+    ops::Range,
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
@@ -113,8 +115,8 @@ fn main() {
     let sampler = Sampler::new(
         // TODO: Do I need to handle angle wrapping?
         // (State([-75., -75., 0., 0.]), State([75., 75., 7., 2. * PI])),
-        (State([-75., -75., 0., -PI]), State([75., 75., 7., PI])),
-        0.1,
+        (State([-75., -75., 0., 0.]), State([75., 75., 4., TAU])),
+        0.3,
     );
 
     let max_turn_rate = 0.025; // 0.025 * 30 = 0.75 radians
@@ -126,21 +128,21 @@ fn main() {
         trial.initial_enu_east_km,
         trial.initial_enu_north_km,
         trial.initial_enu_up_km,
-        trial.initial_bearing,
+        trial.initial_bearing.rem_euclid(TAU),
     ]);
 
-    let goal = State([
+    let goal = StateRegion::from_state(State([
         trial.target_enu_east_km,
         trial.target_enu_north_km,
         trial.target_enu_up_km,
-        trial.target_bearing,
-    ]);
+        trial.target_bearing.rem_euclid(TAU),
+    ]));
 
     let planner = RRTPlanner::new();
     let mut plan = planner.create_plan(start, goal, airplane, rand::rng());
     let mut results = Results::default();
 
-    let poll_after = 1000;
+    let poll_after = 5000;
     let timeout = Duration::from_secs(3 * 60);
     let mut elapsed = Duration::ZERO;
 
@@ -161,7 +163,7 @@ fn main() {
         );
     }
 
-    // plan.print_to_file("rrt_plan.g");
+    plan.print_to_file("rrt_tree.g");
     plan.print_solution_to_file("rrt_plan.g");
     let mut writer = csv::Writer::from_path(cli.output_path).unwrap();
     writer.serialize(results).unwrap();
@@ -226,7 +228,7 @@ impl Airplane {
         let t_min = xy_dist / self.xy_velocity;
         let max_alt_change = self.max_alt_rate * t_min;
         let alt_change = from.0[2] - to.0[2];
-        let valid = max_alt_change > alt_change.abs();
+        let valid = max_alt_change >= alt_change.abs();
 
         Some(((xy_dist.powf(2.) + alt_change.powf(2.)).sqrt(), valid))
     }
@@ -253,6 +255,7 @@ impl Airplane {
     }
 }
 
+#[derive(PartialEq)]
 struct Vertex {
     parent: Option<usize>,
     state: State,
@@ -306,6 +309,7 @@ impl Sampler {
 
 struct World {
     vertices: Vec<Vertex>,
+    tree: KdTree<f64, usize, [f64; 4]>,
 }
 
 enum Dir {
@@ -315,13 +319,14 @@ enum Dir {
 
 impl World {
     pub fn new(start: State) -> Self {
+        let mut tree = KdTree::new(4);
+        tree.add(start.0, 0).unwrap();
         let vertices = vec![Vertex {
             parent: None,
             state: start,
             cost_to_come: 0.,
         }];
-
-        World { vertices }
+        World { vertices, tree }
     }
 
     fn root(&self) -> usize {
@@ -345,12 +350,15 @@ impl World {
     }
 
     fn insert(&mut self, state: State) -> usize {
+        let ix = self.vertices.len();
+        self.tree.add(state.0, ix).unwrap();
         self.vertices.push(Vertex {
             parent: None,
             state,
             cost_to_come: f64::INFINITY,
         });
-        self.vertices.len() - 1
+
+        ix
     }
 
     fn parent(&self, ix: usize) -> Option<Option<usize>> {
@@ -372,15 +380,20 @@ impl World {
         dir: Dir,
         k: usize,
     ) -> Vec<(usize, (f64, bool))> {
-        self.vertices
-            .iter()
-            .enumerate()
-            // Filter by euclidean distance for performance.
-            .map(|(i, v)| (i, v, v.state.dist(state)))
-            .k_smallest_by(2 * k, |(_, _, da), (_, _, db)| {
-                da.partial_cmp(&db).expect("distances are well-ordered")
-            })
-            .map(|(i, v, _)| (i, v))
+        // self.vertices
+        //     .iter()
+        //     .enumerate()
+        //     // Filter by euclidean distance for performance.
+        //     .map(|(i, v)| (i, v, v.state.dist(state)))
+        //     .k_smallest_by(2 * k, |(_, _, da), (_, _, db)| {
+        //         da.partial_cmp(&db).expect("distances are well-ordered")
+        //     })
+
+        self.tree
+            .iter_nearest(&state.0, &squared_euclidean)
+            .unwrap()
+            .take(4 * k)
+            .map(|(_, ix)| (*ix, &self.vertices[*ix]))
             .filter_map(|(i, v)| {
                 // We can't fly backwards...
                 let length_between = match dir {
@@ -406,7 +419,7 @@ impl RRTPlanner {
     pub fn create_plan<R: Rng>(
         &self,
         start: State,
-        goal: State,
+        goal: StateRegion,
         airplane: Airplane,
         rng: R,
     ) -> RRTPlan<R, State> {
@@ -429,12 +442,8 @@ impl RRTPlanner {
     ) -> RRTPlan<R, State> {
         plan.iters += 1;
 
-        let mut is_goal = false;
         let sample = match sampler.sample(plan.rng()) {
-            Sample::Goal => {
-                is_goal = true;
-                plan.goal.clone()
-            }
+            Sample::Goal => plan.goal.center().clone(),
             Sample::State(state) => state,
         };
 
@@ -467,12 +476,7 @@ impl RRTPlanner {
         let alt_change = (sample.0[2] - nearest_state.0[2]).clamp(-max_alt_change, max_alt_change);
 
         let z = nearest_state.0[2] + alt_change;
-        let state = State([xyb.x(), xyb.y(), z, xyb.rot()]);
-
-        if is_goal && plan.goal_ix.is_some() {
-            // Already found the goal.
-            return plan;
-        }
+        let mut state = State([xyb.x(), xyb.y(), z, xyb.rot().rem_euclid(TAU)]);
 
         // Connect this state to the state which provides the lowest cost-to-come.
         let Some((parent_ix, cost_to_come)) = plan
@@ -494,29 +498,24 @@ impl RRTPlanner {
         else {
             // No valid parents exist for this state.
             // Lets try again...
+            // eprintln!("no valid parents for state");
             return plan;
         };
 
-        let ix = if !is_goal {
-            // We didn't sample the goal.
-            // - Insert
-            // - Return ix
-            plan.world.insert(state.clone())
-        } else if let Some(ix) = plan.goal_ix {
-            // We sampled the goal and we have done so before.
-            //  - Return goal_ix
-            ix
-        } else {
-            // We sampled the goal and we have not done so before.
-            //  - Insert
-            //  - Set goal_ix
-            //  - Return goal_ix
-            println!("found goal");
+        let ix = plan.world.insert(state.clone());
+        let is_goal = plan.goal.contains(&state);
 
-            let ix = plan.world.insert(state.clone());
+        // We didn't sample the goal.
+        // - Insert
+
+        if is_goal {
+            // We sampled the goal.
+            //  - Set the goal to the new state
+            //  - Return goal_ix
+
+            println!("found goal: (have goal: {})", plan.goal_ix.is_some());
             plan.goal_ix = Some(ix);
-            ix
-        };
+        }
 
         *plan.world.parent_mut(ix).unwrap() = Some(parent_ix);
         *plan.world.cost_to_come_mut(ix).unwrap() = cost_to_come;
@@ -548,10 +547,69 @@ impl RRTPlanner {
     }
 }
 
+#[derive(Clone, Debug)]
+struct StateRegion {
+    center: State,
+    x: Range<f64>,
+    y: Range<f64>,
+    z: Range<f64>,
+    b: Range<f64>,
+}
+
+impl StateRegion {
+    pub fn from_state(center: State) -> Self {
+        // let xy = 1.5;
+        // let z = 0.75;
+        // let b = 0.375;
+
+        let xy = 0.5;
+        let z = 0.25;
+        let b = 0.125;
+
+        let start = (center.0[3] - b).rem_euclid(TAU);
+        let end = (center.0[3] + b).rem_euclid(TAU);
+        let sr = Self {
+            x: Range {
+                start: center.0[0] - xy,
+                end: center.0[0] + xy,
+            },
+            y: Range {
+                start: center.0[1] - xy,
+                end: center.0[1] + xy,
+            },
+            z: Range {
+                start: center.0[2] - z,
+                end: center.0[2] + z,
+            },
+            // TODO: This is probably bad for wrapping
+            b: Range {
+                start: start.min(end),
+                end: start.max(end),
+            },
+            center,
+        };
+
+        // println!("{:?}", sr.b);
+
+        sr
+    }
+
+    pub fn contains(&self, state: &State) -> bool {
+        self.x.contains(&state.0[0])
+            && self.y.contains(&state.0[1])
+            && self.z.contains(&state.0[2])
+            && self.b.contains(&state.0[3])
+    }
+
+    pub fn center(&self) -> &State {
+        &self.center
+    }
+}
+
 struct RRTPlan<R, S> {
     world: World,
     rng: R,
-    goal: State,
+    goal: StateRegion,
     goal_ix: Option<usize>,
     airplane: Airplane,
     iters: usize,
