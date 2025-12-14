@@ -1,0 +1,794 @@
+use atcrs::PenaltyMap;
+use clap::Parser;
+use dubins_paths::DubinsPath;
+use itertools::Itertools;
+use kdtree::{KdTree, distance::squared_euclidean};
+use rand::Rng;
+use rand_distr::StandardNormal;
+use std::{
+    f64::consts::{E, TAU},
+    fs::File,
+    io::{BufWriter, Write},
+    marker::PhantomData,
+    ops::Range,
+    path::{Path, PathBuf},
+    time::{Duration, Instant},
+};
+
+#[derive(serde::Serialize)]
+struct BenchSample {
+    iters: usize,
+    state_count: usize,
+    duration_ms: f64,
+    iters_per_ms: f64,
+}
+
+#[derive(Parser)]
+struct Cli {
+    trial_path: PathBuf,
+    penalty_path: PathBuf,
+    output_path: PathBuf,
+}
+
+#[derive(serde::Deserialize)]
+struct Trial {
+    fa_flight_id: String,
+    initial_enu_east_km: f64,
+    initial_enu_north_km: f64,
+    initial_enu_up_km: f64,
+    initial_bearing: f64,
+    target_enu_east_km: f64,
+    target_enu_north_km: f64,
+    target_enu_up_km: f64,
+    target_bearing: f64,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct Results {
+    elapsed_30s_ms: u128,
+    elapsed_1m_ms: u128,
+    elapsed_3m_ms: u128,
+
+    path_length_30s: f64,
+    path_length_1m: f64,
+    path_length_3m: f64,
+
+    iters_30s: usize,
+    iters_1m: usize,
+    iters_3m: usize,
+
+    states_30s: usize,
+    states_1m: usize,
+    states_3m: usize,
+}
+
+impl Results {
+    fn update(
+        mut self,
+        elapsed: Duration,
+        path_length: f64,
+        iters: usize,
+        states: usize,
+    ) -> Results {
+        if elapsed <= Duration::from_secs(30) {
+            self.elapsed_30s_ms = elapsed.as_millis();
+            self.path_length_30s = path_length;
+            self.iters_30s = iters;
+            self.states_30s = states;
+        } else if elapsed <= Duration::from_secs(1 * 60) {
+            self.elapsed_1m_ms = elapsed.as_millis();
+            self.path_length_1m = path_length;
+            self.iters_1m = iters;
+            self.states_1m = states;
+        } else if elapsed <= Duration::from_secs(3 * 60) {
+            self.elapsed_3m_ms = elapsed.as_millis();
+            self.path_length_3m = path_length;
+            self.iters_3m = iters;
+            self.states_3m = states;
+        }
+
+        self
+    }
+}
+
+impl Default for Results {
+    fn default() -> Self {
+        Self {
+            elapsed_30s_ms: Default::default(),
+            elapsed_1m_ms: Default::default(),
+            elapsed_3m_ms: Default::default(),
+            path_length_30s: f64::INFINITY,
+            path_length_1m: f64::INFINITY,
+            path_length_3m: f64::INFINITY,
+            iters_30s: Default::default(),
+            iters_1m: Default::default(),
+            iters_3m: Default::default(),
+            states_30s: Default::default(),
+            states_1m: Default::default(),
+            states_3m: Default::default(),
+        }
+    }
+}
+
+fn main() {
+    let cli = Cli::parse();
+    let reader = File::open(cli.trial_path).unwrap();
+    let trial: Trial = serde_json::from_reader(reader).unwrap();
+
+    let max_turn_rate = 0.025; // 0.025 * 30 = 0.75 radians
+    let max_alt_rate = 0.006;
+    let xy_velocity = 0.1;
+    let airplane = Airplane::new(max_turn_rate, max_alt_rate, xy_velocity);
+
+    let start = State([
+        trial.initial_enu_east_km,
+        trial.initial_enu_north_km,
+        trial.initial_enu_up_km,
+        trial.initial_bearing.rem_euclid(TAU),
+    ]);
+
+    let goal = StateRegion::from_state(State([
+        trial.target_enu_east_km,
+        trial.target_enu_north_km,
+        trial.target_enu_up_km,
+        trial.target_bearing.rem_euclid(TAU),
+    ]));
+
+    let penalty = PenaltyMap::from_path(cli.penalty_path).unwrap();
+    let goal_sampling_chance = 0.1;
+    let beta = 5.;
+    let step = 0.3;
+    let mut sampler = Sampler::new(
+        (State([-75., -75., 0., 0.]), State([75., 75., 4., TAU])),
+        start.clone(),
+        &penalty,
+        goal_sampling_chance,
+        beta,
+        step,
+    );
+
+    let planner = RRTPlanner::new();
+    let mut plan = planner.create_plan(start, goal, airplane, rand::rng());
+    let mut results = Results::default();
+
+    let poll_after = 5000;
+    let timeout = Duration::from_secs(3 * 60);
+    let mut elapsed = Duration::ZERO;
+
+    while elapsed < timeout {
+        let start = Instant::now();
+        for _ in 0..poll_after {
+            plan = planner.plan_from(plan, &mut sampler, &penalty);
+        }
+        let duration = start.elapsed();
+        elapsed += duration;
+
+        println!("{} of {}", elapsed.as_secs(), timeout.as_secs());
+        results = results.update(
+            elapsed,
+            plan.path_length(),
+            plan.iter_count(),
+            plan.state_count(),
+        );
+    }
+
+    plan.print_to_file("mc_rrt_tree.g");
+    plan.print_solution_to_file("mc_rrt_plan.g");
+    let mut writer = csv::Writer::from_path(cli.output_path).unwrap();
+    writer.serialize(results).unwrap();
+}
+
+trait Statelike {
+    fn dim() -> usize;
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct State([f64; 4]);
+
+impl State {
+    fn dist(&self, state: &State) -> f64 {
+        ((state.0[0] - self.0[0]).powf(2.)
+            + (state.0[1] - self.0[1]).powf(2.)
+            + (state.0[2] - self.0[2]).powf(2.)
+            + (state.0[3] - self.0[3]).powf(2.))
+        .sqrt()
+    }
+}
+
+impl Statelike for State {
+    fn dim() -> usize {
+        4
+    }
+}
+
+struct Airplane {
+    //max_turn_rate: f64,
+    max_alt_rate: f64,
+    xy_velocity: f64,
+    turn_radius: f64,
+}
+
+impl Airplane {
+    fn new(max_turn_rate: f64, max_alt_rate: f64, xy_velocity: f64) -> Self {
+        Self {
+            max_alt_rate,
+            xy_velocity,
+            turn_radius: xy_velocity / max_turn_rate,
+        }
+    }
+
+    fn shortest_xy_path(&self, from: &State, to: &State) -> Option<DubinsPath> {
+        let q0 = [from.0[0], from.0[1], from.0[3]].into();
+        let q1 = [to.0[0], to.0[1], to.0[3]].into();
+        DubinsPath::shortest_from(q0, q1, self.turn_radius).ok()
+    }
+
+    fn xy_velocity(&self) -> f64 {
+        self.xy_velocity
+    }
+
+    fn max_alt_rate(&self) -> f64 {
+        self.max_alt_rate
+    }
+
+    fn length_between(&self, from: &State, to: &State) -> Option<(f64, bool)> {
+        let shortest_path = self.shortest_xy_path(from, to)?;
+        let xy_dist = shortest_path.length();
+        let t_min = xy_dist / self.xy_velocity;
+        let max_alt_change = self.max_alt_rate * t_min;
+        let alt_change = from.0[2] - to.0[2];
+        let valid = max_alt_change >= alt_change.abs();
+
+        Some(((xy_dist.powf(2.) + alt_change.powf(2.)).sqrt(), valid))
+    }
+
+    // Makes no guarantees about the constraints on the path between from and to.
+    fn subdivide(&self, from: &State, to: &State, every: Duration) -> Vec<State> {
+        let Some(shortest_path) = self.shortest_xy_path(from, to) else {
+            return Vec::new();
+        };
+
+        let step_distance = self.xy_velocity * every.as_secs() as f64;
+        let total_alt_change = to.0[2] - from.0[2];
+
+        // Use similar triangles...
+        let edge_ratio = total_alt_change / shortest_path.length();
+
+        shortest_path
+            .sample_many(step_distance)
+            .into_iter()
+            .enumerate()
+            .map(|(i, sample)| (step_distance * edge_ratio * (i as f64), sample))
+            .map(|(dz, sample)| State([sample.x(), sample.y(), from.0[2] + dz, sample.rot()]))
+            .collect()
+    }
+}
+
+#[derive(PartialEq)]
+struct Vertex {
+    parent: Option<usize>,
+    state: State,
+    cost_to_come: f64,
+}
+
+enum Sample {
+    Goal,
+    State(State),
+}
+
+struct Sampler {
+    min: State,
+    max: State,
+    goal_sampling_chance: f64,
+    beta: f64,
+    last_penalty: f64,
+    last_state: State,
+    step: f64,
+}
+
+impl Sampler {
+    fn new(
+        corners: (State, State),
+        seed_state: State,
+        penalty: &PenaltyMap,
+        goal_sampling_chance: f64,
+        beta: f64,
+        step: f64,
+    ) -> Self {
+        Self {
+            min: State([
+                corners.0.0[0].min(corners.1.0[0]),
+                corners.0.0[1].min(corners.1.0[1]),
+                corners.0.0[2].min(corners.1.0[2]),
+                corners.0.0[3].min(corners.1.0[3]),
+            ]),
+            max: State([
+                corners.0.0[0].max(corners.1.0[0]),
+                corners.0.0[1].max(corners.1.0[1]),
+                corners.0.0[2].max(corners.1.0[2]),
+                corners.0.0[3].max(corners.1.0[3]),
+            ]),
+            goal_sampling_chance,
+            beta,
+            step,
+            last_penalty: penalty.penalty(&seed_state.0),
+            last_state: seed_state,
+        }
+    }
+
+    fn sample<R: Rng>(&mut self, penalty: &PenaltyMap, rng: &mut R) -> Sample {
+        if rng.random_bool(self.goal_sampling_chance) {
+            return Sample::Goal;
+        }
+
+        loop {
+            let mut state = self.last_state.clone();
+            for i in 0..4 {
+                state.0[i] += self.step * rng.sample::<f64, _>(StandardNormal);
+                state.0[i] = state.0[i].clamp(self.min.0[0], self.max.0[0]);
+            }
+
+            let pen = penalty.penalty(&state.0);
+            let p = (-self.beta * (pen - self.last_penalty)).exp();
+            if rng.random_bool(p.min(1.0)) {
+                self.last_state = state;
+                self.last_penalty = pen;
+                break;
+            }
+        }
+
+        return Sample::State(self.last_state.clone());
+    }
+}
+
+struct World {
+    vertices: Vec<Vertex>,
+    tree: KdTree<f64, usize, [f64; 4]>,
+}
+
+enum Dir {
+    From,
+    To,
+}
+
+impl World {
+    pub fn new(start: State) -> Self {
+        let mut tree = KdTree::new(4);
+        tree.add(start.0, 0).unwrap();
+        let vertices = vec![Vertex {
+            parent: None,
+            state: start,
+            cost_to_come: 0.,
+        }];
+        World { vertices, tree }
+    }
+
+    fn root(&self) -> usize {
+        0
+    }
+
+    fn all(&self) -> Vec<usize> {
+        (0..self.vertices.len()).collect()
+    }
+
+    fn state(&self, ix: usize) -> Option<&State> {
+        self.vertices.get(ix).map(|v| &v.state)
+    }
+
+    fn cost_to_come(&self, ix: usize) -> Option<f64> {
+        self.vertices.get(ix).map(|v| v.cost_to_come)
+    }
+
+    fn cost_to_come_mut(&mut self, ix: usize) -> Option<&mut f64> {
+        self.vertices.get_mut(ix).map(|v| &mut v.cost_to_come)
+    }
+
+    fn insert(&mut self, state: State) -> usize {
+        let ix = self.vertices.len();
+        self.tree.add(state.0, ix).unwrap();
+        self.vertices.push(Vertex {
+            parent: None,
+            state,
+            cost_to_come: f64::INFINITY,
+        });
+
+        ix
+    }
+
+    fn parent(&self, ix: usize) -> Option<Option<usize>> {
+        self.vertices.get(ix).map(|v| v.parent)
+    }
+
+    fn parent_mut(&mut self, ix: usize) -> Option<&mut Option<usize>> {
+        self.vertices.get_mut(ix).map(|v| &mut v.parent)
+    }
+
+    pub fn state_count(&self) -> usize {
+        self.vertices.len()
+    }
+
+    pub fn k_nearest(
+        &self,
+        airplane: &Airplane,
+        state: &State,
+        dir: Dir,
+        k: usize,
+    ) -> Vec<(usize, (f64, bool))> {
+        // self.vertices
+        //     .iter()
+        //     .enumerate()
+        //     // Filter by euclidean distance for performance.
+        //     .map(|(i, v)| (i, v, v.state.dist(state)))
+        //     .k_smallest_by(2 * k, |(_, _, da), (_, _, db)| {
+        //         da.partial_cmp(&db).expect("distances are well-ordered")
+        //     })
+
+        self.tree
+            .iter_nearest(&state.0, &squared_euclidean)
+            .unwrap()
+            .take(4 * k)
+            .map(|(_, ix)| (*ix, &self.vertices[*ix]))
+            .filter_map(|(i, v)| {
+                // We can't fly backwards...
+                let length_between = match dir {
+                    Dir::To => airplane.length_between(&v.state, state),
+                    Dir::From => airplane.length_between(state, &v.state),
+                };
+                Some((i, length_between?))
+            })
+            .k_smallest_by(k, |(_, (da, _)), (_, (db, _))| {
+                da.partial_cmp(&db).expect("distances are well-ordered")
+            })
+            .collect()
+    }
+}
+
+struct RRTPlanner {}
+
+impl RRTPlanner {
+    pub fn new() -> Self {
+        Self {}
+    }
+
+    pub fn create_plan<R: Rng>(
+        &self,
+        start: State,
+        goal: StateRegion,
+        airplane: Airplane,
+        rng: R,
+    ) -> RRTPlan<R, State> {
+        RRTPlan {
+            world: World::new(start),
+            rng,
+            goal,
+            goal_ix: None,
+            airplane,
+            iters: 0,
+            k_factor: E * (1. + 1. / State::dim() as f64),
+            phan: PhantomData,
+        }
+    }
+
+    pub fn plan_from<R: Rng>(
+        &self,
+        mut plan: RRTPlan<R, State>,
+        sampler: &mut Sampler,
+        penalty: &PenaltyMap,
+    ) -> RRTPlan<R, State> {
+        plan.iters += 1;
+
+        let mut sample_goal = false;
+        let sample = match sampler.sample(penalty, plan.rng()) {
+            Sample::Goal => {
+                sample_goal = true;
+                plan.goal.center().clone()
+            }
+            Sample::State(state) => state,
+        };
+
+        let (nearest_ix, _) = plan.world.k_nearest(&plan.airplane, &sample, Dir::To, 1)[0];
+        let nearest_state = plan.world.state(nearest_ix).expect("nearest_ix exists");
+
+        // What does it mean to steer?
+        // We want to find the closest state to sample that obeys our constraints.
+        // Dubins curve will give us the minimum time (t_min) to reach the sample in the XY plane.
+        // Then, we compute the maximum altitude change we can perform in t_min.
+        // We pick the smallest absolute altitude change between the maximum with our constraints
+        // and the change to get to the sample exactly.
+
+        let Some(shortest_path) = plan.airplane.shortest_xy_path(&nearest_state, &sample) else {
+            eprintln!("no path exists from nearest to the sample");
+
+            // just try a different sample...
+            return plan;
+        };
+
+        let d_max = shortest_path.length();
+        let d_steer = plan.airplane.xy_velocity() * 30.0;
+        let d = d_max.min(d_steer);
+        let xyb = shortest_path.sample(d);
+
+        // Clamp the alt_change to prevent us from violating our constraints.
+        // let alt_change = (nearest_state.0[2] - sample.0[2]).clamp(-max_alt_change, max_alt_change);
+        let t = d / plan.airplane.xy_velocity();
+        let max_alt_change = plan.airplane.max_alt_rate() * t;
+        let alt_change = (sample.0[2] - nearest_state.0[2]).clamp(-max_alt_change, max_alt_change);
+
+        let z = nearest_state.0[2] + alt_change;
+        let state = State([xyb.x(), xyb.y(), z, xyb.rot().rem_euclid(TAU)]);
+
+        // Connect this state to the state which provides the lowest cost-to-come.
+        let Some((parent_ix, cost_to_come)) = plan
+            .world
+            // Move to the state from its parents.
+            .k_nearest(&plan.airplane, &state, Dir::To, plan.k_bound())
+            .into_iter()
+            .filter(|(_, (_, valid))| *valid)
+            .map(|(ix, (length_between, _))| {
+                (
+                    ix,
+                    plan.world
+                        .cost_to_come(ix)
+                        .expect("k_nearest gives valid ids")
+                        + length_between,
+                )
+            })
+            .min_by(|(_, a), (_, b)| a.partial_cmp(&b).expect("costs are well-ordered"))
+        else {
+            // No valid parents exist for this state.
+            // Lets try again...
+            eprintln!("no valid parents for state (sample goal: {})", sample_goal);
+            return plan;
+        };
+
+        let ix = plan.world.insert(state.clone());
+        let is_goal = plan.goal.contains(&state);
+
+        // We didn't sample the goal.
+        // - Insert
+
+        // if !is_goal && sample_goal {
+        //     println!(
+        //         "sampled goal but didn't reach it: ({:.0}% of d_max)",
+        //         d / d_max * 100.
+        //     );
+        // }
+
+        if is_goal {
+            // We sampled the goal.
+            //  - Set the goal to the new state
+            //  - Return goal_ix
+
+            println!("found goal: (have goal: {})", plan.goal_ix.is_some());
+            plan.goal_ix = Some(ix);
+        }
+
+        *plan.world.parent_mut(ix).unwrap() = Some(parent_ix);
+        *plan.world.cost_to_come_mut(ix).unwrap() = cost_to_come;
+
+        // Locally optimize...
+        for (child_ix, (length_between, _)) in plan
+            .world
+            // Move from the state to its neighbours.
+            .k_nearest(&plan.airplane, &state, Dir::From, plan.k_bound())
+            .into_iter()
+            .filter(|(cix, _)| *cix != parent_ix)
+            // Check whether this edge violates our constraints.
+            // Could fail to find a path; we assume this means this edge violates the motion constraints.
+            .filter(|(_, (_, valid))| *valid)
+        {
+            let child_cost_to_come = cost_to_come + length_between;
+            if plan.world.cost_to_come(child_ix).unwrap() <= child_cost_to_come {
+                // Already optimal.
+                continue;
+            }
+
+            // We found a better path, which does not violate any constraints, and lets use it.
+            // TODO: This API is bad because it would let us set the parent to None.
+            *plan.world.parent_mut(child_ix).unwrap() = Some(ix);
+            *plan.world.cost_to_come_mut(child_ix).unwrap() = child_cost_to_come;
+        }
+
+        plan
+    }
+}
+
+#[derive(Clone, Debug)]
+struct StateRegion {
+    center: State,
+    x: Range<f64>,
+    y: Range<f64>,
+    z: Range<f64>,
+    b: Range<f64>,
+}
+
+impl StateRegion {
+    pub fn from_state(center: State) -> Self {
+        // let xy = 1.5;
+        // let z = 0.75;
+        // let b = 0.375;
+
+        let xy = 0.5;
+        let z = 0.25;
+        let b = 0.125;
+
+        // let xy = 1.;
+        // let z = 0.5;
+        // let b = 0.25;
+
+        let start = (center.0[3] - b).rem_euclid(TAU);
+        let end = (center.0[3] + b).rem_euclid(TAU);
+        let sr = Self {
+            x: Range {
+                start: center.0[0] - xy,
+                end: center.0[0] + xy,
+            },
+            y: Range {
+                start: center.0[1] - xy,
+                end: center.0[1] + xy,
+            },
+            z: Range {
+                start: center.0[2] - z,
+                end: center.0[2] + z,
+            },
+            // TODO: This is probably bad for wrapping
+            b: Range {
+                start: start.min(end),
+                end: start.max(end),
+            },
+            center,
+        };
+
+        // println!("{:?}", sr.b);
+
+        sr
+    }
+
+    pub fn contains(&self, state: &State) -> bool {
+        self.x.contains(&state.0[0])
+            && self.y.contains(&state.0[1])
+            && self.z.contains(&state.0[2])
+            && self.b.contains(&state.0[3])
+    }
+
+    pub fn center(&self) -> &State {
+        &self.center
+    }
+}
+
+struct RRTPlan<R, S> {
+    world: World,
+    rng: R,
+    goal: StateRegion,
+    goal_ix: Option<usize>,
+    airplane: Airplane,
+    iters: usize,
+    k_factor: f64,
+    phan: PhantomData<S>,
+}
+
+impl<R, S> RRTPlan<R, S> {
+    fn rng(&mut self) -> &mut R
+    where
+        R: Rng,
+    {
+        &mut self.rng
+    }
+
+    fn k_bound(&self) -> usize {
+        let card = self.world.state_count() as f64;
+        let bound = (self.k_factor * card.log2()).ceil() as usize;
+        bound.clamp(1, usize::MAX)
+    }
+
+    fn state_count(&self) -> usize {
+        self.world.state_count()
+    }
+
+    fn print_to_file<P: AsRef<Path>>(&self, path: P) {
+        println!("state count: {}", self.world.state_count());
+
+        let file = File::create(&path).unwrap();
+        let mut writer = BufWriter::new(file);
+        // let mut writer = std::io::stdout();
+
+        for ix in self.world.all() {
+            let state = self.world.state(ix).unwrap();
+            let cost_to_come = self.world.cost_to_come(ix).unwrap();
+
+            let _ = writeln!(
+                writer,
+                "v {} {:.2} {:.2} {:.2} {:.2} {:.2} {:.2}",
+                ix, state.0[0], state.0[1], state.0[2], state.0[3], cost_to_come, 0.,
+            );
+
+            if let Some(parent_ix) = self.world.parent(ix).unwrap() {
+                let _ = writeln!(writer, "e {} {}", parent_ix, ix);
+            }
+        }
+    }
+
+    fn print_solution_to_file<P: AsRef<Path>>(&self, path: P) {
+        let Some(goal_ix) = self.goal_ix else {
+            eprintln!("no solution found");
+            return;
+        };
+
+        let file = File::create(&path).unwrap();
+        let mut writer = BufWriter::new(file);
+        // let mut writer = std::io::stdout();
+
+        let mut vertices = Vec::new();
+
+        let mut ix = goal_ix;
+        loop {
+            let state = self.world.state(ix).unwrap();
+            let cost_to_come = self.world.cost_to_come(ix).unwrap();
+            let parent = self.world.parent(ix).unwrap();
+            vertices.push((state.clone(), cost_to_come, true));
+
+            if let Some(parent_ix) = parent {
+                // Insert vertices along the path...
+                let parent_state = self.world.state(parent_ix).unwrap();
+                let substates =
+                    self.airplane
+                        .subdivide(parent_state, state, Duration::from_secs(5));
+
+                // Need to remove the first and last from the list because these will be added as
+                // original states...
+                let len_between = substates.len().saturating_sub(2);
+                for substate in substates.into_iter().skip(1).take(len_between).rev() {
+                    vertices.push((substate, cost_to_come, false));
+                }
+
+                ix = parent_ix;
+            } else {
+                break;
+            }
+        }
+
+        for (ix, (state, cost_to_come, original)) in vertices.iter().enumerate() {
+            let _ = writeln!(
+                writer,
+                "v {} {:.2} {:.2} {:.2} {:.2} {:.2} {:.2} {}",
+                ix, state.0[0], state.0[1], state.0[2], state.0[3], cost_to_come, 0., original
+            );
+
+            let parent_ix = ix + 1;
+            if parent_ix < vertices.len() {
+                let _ = writeln!(writer, "e {} {}", parent_ix, ix);
+            }
+        }
+    }
+
+    fn path_length(&self) -> f64 {
+        match self.goal_ix {
+            Some(ix) => self.world.cost_to_come(ix).unwrap(),
+            None => f64::INFINITY,
+        }
+    }
+
+    fn iter_count(&self) -> usize {
+        self.iters
+    }
+}
+
+#[test]
+fn test_subdivide() {
+    let from = State([56.57, 47.70, 3.37, -2.83]);
+    let to = State([-0.45, 2.94, 0.97, -1.58]);
+
+    let max_turn_rate = 0.025;
+    let max_alt_rate = 0.006;
+    let xy_velocity = 0.1;
+
+    dbg!(
+        Airplane::new(max_turn_rate, max_alt_rate, xy_velocity)
+            .subdivide(&from, &to, Duration::from_secs(5),)
+            .into_iter()
+            .map(|state| state.0[3])
+            .collect::<Vec<_>>()
+    );
+
+    // panic!()
+}

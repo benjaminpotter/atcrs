@@ -22,7 +22,7 @@ system!(struct GroundEnu using ENU);
 fn main() -> Result<()> {
     let airports_response = read_airports_response("airports_response.json")?;
     let max_haversine_distance = Length::new::<kilometer>(75.0);
-    let dataset_path = PathBuf::from("/home/ben/downloads/flight_aware_dataset/flight_track");
+    let dataset_path = PathBuf::from("dataset/flight_track");
     let output_path = "penalty.csv";
 
     let airport = Wgs84::builder()
