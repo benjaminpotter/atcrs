@@ -136,15 +136,15 @@ fn main() {
 
     let penalty = PenaltyMap::from_path(cli.penalty_path).unwrap();
     let goal_sampling_chance = 0.1;
-    let beta = 5.;
-    let step = 0.3;
+    let beta = 1.5;
+    let step = 0.15;
+    let reset_after = 1000;
     let mut sampler = Sampler::new(
         (State([-75., -75., 0., 0.]), State([75., 75., 4., TAU])),
-        start.clone(),
-        &penalty,
         goal_sampling_chance,
         beta,
         step,
+        reset_after,
     );
 
     let planner = RRTPlanner::new();
@@ -237,7 +237,9 @@ impl Airplane {
         let t_min = xy_dist / self.xy_velocity;
         let max_alt_change = self.max_alt_rate * t_min;
         let alt_change = from.0[2] - to.0[2];
-        let valid = max_alt_change >= alt_change.abs();
+
+        // Change for mc rrt to only be valid if under 30 seconds..
+        let valid = max_alt_change >= alt_change.abs() && t_min <= 30.;
 
         Some(((xy_dist.powf(2.) + alt_change.powf(2.)).sqrt(), valid))
     }
@@ -281,19 +283,19 @@ struct Sampler {
     max: State,
     goal_sampling_chance: f64,
     beta: f64,
-    last_penalty: f64,
-    last_state: State,
+    counter: usize,
+    reset_after: usize,
     step: f64,
+    last: Option<(State, f64)>,
 }
 
 impl Sampler {
     fn new(
         corners: (State, State),
-        seed_state: State,
-        penalty: &PenaltyMap,
         goal_sampling_chance: f64,
         beta: f64,
         step: f64,
+        reset_after: usize,
     ) -> Self {
         Self {
             min: State([
@@ -311,8 +313,9 @@ impl Sampler {
             goal_sampling_chance,
             beta,
             step,
-            last_penalty: penalty.penalty(&seed_state.0),
-            last_state: seed_state,
+            reset_after,
+            counter: 0,
+            last: None,
         }
     }
 
@@ -321,23 +324,45 @@ impl Sampler {
             return Sample::Goal;
         }
 
+        // Do uniform sampling
+        if rng.random_bool(0.1) {
+            let state = [
+                rng.random_range(self.min.0[0]..self.max.0[0]),
+                rng.random_range(self.min.0[1]..self.max.0[1]),
+                rng.random_range(self.min.0[2]..self.max.0[2]),
+                rng.random_range(self.min.0[3]..self.max.0[3]),
+            ];
+            return Sample::State(State(state));
+        }
+
+        self.counter += 1;
+        if self.last.is_none() || self.counter > self.reset_after {
+            let state = [
+                rng.random_range(self.min.0[0]..self.max.0[0]),
+                rng.random_range(self.min.0[1]..self.max.0[1]),
+                rng.random_range(self.min.0[2]..self.max.0[2]),
+                rng.random_range(self.min.0[3]..self.max.0[3]),
+            ];
+            self.last = Some((State(state), penalty.penalty(&state)));
+        }
+
         loop {
-            let mut state = self.last_state.clone();
+            let (mut state, last_penalty) = self.last.as_ref().unwrap().clone();
             for i in 0..4 {
                 state.0[i] += self.step * rng.sample::<f64, _>(StandardNormal);
                 state.0[i] = state.0[i].clamp(self.min.0[0], self.max.0[0]);
             }
 
             let pen = penalty.penalty(&state.0);
-            let p = (-self.beta * (pen - self.last_penalty)).exp();
+            let p = (-self.beta * (pen - last_penalty)).exp();
             if rng.random_bool(p.min(1.0)) {
-                self.last_state = state;
-                self.last_penalty = pen;
+                self.last = Some((state, pen));
                 break;
             }
         }
 
-        return Sample::State(self.last_state.clone());
+        let (state, _) = self.last.as_ref().unwrap().clone();
+        return Sample::State(state);
     }
 }
 
@@ -436,9 +461,9 @@ impl World {
                 };
                 Some((i, length_between?))
             })
-            .k_smallest_by(k, |(_, (da, _)), (_, (db, _))| {
-                da.partial_cmp(&db).expect("distances are well-ordered")
-            })
+            // .k_smallest_by(k, |(_, (da, _)), (_, (db, _))| {
+            //     da.partial_cmp(&db).expect("distances are well-ordered")
+            // })
             .collect()
     }
 }
@@ -537,7 +562,7 @@ impl RRTPlanner {
         else {
             // No valid parents exist for this state.
             // Lets try again...
-            eprintln!("no valid parents for state (sample goal: {})", sample_goal);
+            // eprintln!("no valid parents for state (sample goal: {})", sample_goal);
             return plan;
         };
 
