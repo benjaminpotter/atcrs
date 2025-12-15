@@ -136,13 +136,15 @@ fn main() {
 
     let penalty = PenaltyMap::from_path(cli.penalty_path).unwrap();
     let goal_sampling_chance = 0.1;
-    let beta = 1.5;
-    let step = 0.15;
-    let reset_after = 1000;
+    let beta = 8.;
+    let step = 1.0;
+    let goal_std = 1.5;
+    let reset_after = 500;
     let mut sampler = Sampler::new(
         (State([-75., -75., 0., 0.]), State([75., 75., 4., TAU])),
         goal_sampling_chance,
         beta,
+        goal_std,
         step,
         reset_after,
     );
@@ -192,6 +194,10 @@ impl State {
             + (state.0[2] - self.0[2]).powf(2.)
             + (state.0[3] - self.0[3]).powf(2.))
         .sqrt()
+    }
+
+    fn sq_mag(&self) -> f64 {
+        self.0.iter().map(|c| c.powf(2.)).sum()
     }
 }
 
@@ -287,6 +293,7 @@ struct Sampler {
     reset_after: usize,
     step: f64,
     last: Option<(State, f64)>,
+    goal_std: f64,
 }
 
 impl Sampler {
@@ -295,6 +302,7 @@ impl Sampler {
         goal_sampling_chance: f64,
         beta: f64,
         step: f64,
+        goal_std: f64,
         reset_after: usize,
     ) -> Self {
         Self {
@@ -313,10 +321,16 @@ impl Sampler {
             goal_sampling_chance,
             beta,
             step,
+            goal_std,
             reset_after,
             counter: 0,
             last: None,
         }
+    }
+
+    fn penalty(&self, state: &State, _penalty_map: &PenaltyMap) -> f64 {
+        // penalty_map.penalty(&state.0)
+        (-state.sq_mag() / self.goal_std.powf(2.)).exp()
     }
 
     fn sample<R: Rng>(&mut self, penalty: &PenaltyMap, rng: &mut R) -> Sample {
@@ -335,25 +349,26 @@ impl Sampler {
             return Sample::State(State(state));
         }
 
-        self.counter += 1;
         if self.last.is_none() || self.counter > self.reset_after {
-            let state = [
+            let state = State([
                 rng.random_range(self.min.0[0]..self.max.0[0]),
                 rng.random_range(self.min.0[1]..self.max.0[1]),
                 rng.random_range(self.min.0[2]..self.max.0[2]),
                 rng.random_range(self.min.0[3]..self.max.0[3]),
-            ];
-            self.last = Some((State(state), penalty.penalty(&state)));
+            ]);
+            let pen = self.penalty(&state, penalty);
+            self.last = Some((state, pen));
         }
 
         loop {
+            self.counter += 1;
             let (mut state, last_penalty) = self.last.as_ref().unwrap().clone();
             for i in 0..4 {
                 state.0[i] += self.step * rng.sample::<f64, _>(StandardNormal);
-                state.0[i] = state.0[i].clamp(self.min.0[0], self.max.0[0]);
+                state.0[i] = state.0[i].clamp(self.min.0[i], self.max.0[i]);
             }
 
-            let pen = penalty.penalty(&state.0);
+            let pen = self.penalty(&state, penalty);
             let p = (-self.beta * (pen - last_penalty)).exp();
             if rng.random_bool(p.min(1.0)) {
                 self.last = Some((state, pen));
@@ -451,7 +466,7 @@ impl World {
         self.tree
             .iter_nearest(&state.0, &squared_euclidean)
             .unwrap()
-            .take(4 * k)
+            .take(2 * k)
             .map(|(_, ix)| (*ix, &self.vertices[*ix]))
             .filter_map(|(i, v)| {
                 // We can't fly backwards...
@@ -461,9 +476,9 @@ impl World {
                 };
                 Some((i, length_between?))
             })
-            // .k_smallest_by(k, |(_, (da, _)), (_, (db, _))| {
-            //     da.partial_cmp(&db).expect("distances are well-ordered")
-            // })
+            .k_smallest_by(k, |(_, (da, _)), (_, (db, _))| {
+                da.partial_cmp(&db).expect("distances are well-ordered")
+            })
             .collect()
     }
 }
@@ -543,6 +558,7 @@ impl RRTPlanner {
         let state = State([xyb.x(), xyb.y(), z, xyb.rot().rem_euclid(TAU)]);
 
         // Connect this state to the state which provides the lowest cost-to-come.
+        let state_pen = penalty.penalty(&state.0);
         let Some((parent_ix, cost_to_come)) = plan
             .world
             // Move to the state from its parents.
@@ -555,7 +571,8 @@ impl RRTPlanner {
                     plan.world
                         .cost_to_come(ix)
                         .expect("k_nearest gives valid ids")
-                        + length_between,
+                        + length_between
+                        + (length_between * state_pen),
                 )
             })
             .min_by(|(_, a), (_, b)| a.partial_cmp(&b).expect("costs are well-ordered"))
@@ -602,7 +619,10 @@ impl RRTPlanner {
             // Could fail to find a path; we assume this means this edge violates the motion constraints.
             .filter(|(_, (_, valid))| *valid)
         {
-            let child_cost_to_come = cost_to_come + length_between;
+            let child_state = plan.world.state(child_ix).unwrap();
+            let child_penalty = penalty.penalty(&child_state.0);
+            let child_cost_to_come =
+                cost_to_come + length_between + (length_between * child_penalty);
             if plan.world.cost_to_come(child_ix).unwrap() <= child_cost_to_come {
                 // Already optimal.
                 continue;

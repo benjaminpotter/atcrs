@@ -417,7 +417,8 @@ impl Weight {
     }
 
     fn cost_to_come(from: &State, with: &Weight, to: &State, penalty: f64) -> f64 {
-        with.cost_to_come + (from.euclidean_dist_to(&to) * penalty)
+        let d = from.euclidean_dist_to(&to);
+        with.cost_to_come + d + (d * penalty)
     }
 }
 
