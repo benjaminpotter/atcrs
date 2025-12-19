@@ -1,5 +1,6 @@
 use anyhow::Context;
 use anyhow::Result;
+use atcrs::PenaltyMap;
 use atcrs::aero::airport::AirportsResponse;
 use atcrs::aero::track::TrackResponse;
 use chrono::prelude::*;
@@ -30,6 +31,8 @@ struct HumanResult {
     fa_flight_id: String,
     path_length_ecld: f64,
     path_length_dbns: f64,
+    motion_cost_ecld: f64,
+    motion_cost_dbns: f64,
 }
 
 fn main() -> Result<()> {
@@ -47,6 +50,8 @@ fn main() -> Result<()> {
 
     let ecef_to_ground_enu =
         unsafe { RigidBodyTransform::<_, GroundEnu>::ecef_to_enu_at(&airport) };
+
+    let penalty_map = PenaltyMap::from_path("penalty.csv")?;
 
     let reader = BufReader::new(std::io::stdin());
     let handles: Vec<(String, String)> = reader
@@ -112,6 +117,8 @@ fn main() -> Result<()> {
 
         let mut path_length_ecld = 0.0;
         let mut path_length_dbns = 0.0;
+        let mut motion_cost_ecld = 0.0;
+        let mut motion_cost_dbns = 0.0;
         for window in positions.windows(2) {
             let &[s0, s1] = window else {
                 eprintln!("windows failed");
@@ -120,12 +127,18 @@ fn main() -> Result<()> {
 
             path_length_ecld += ecld(&s0, &s1);
             path_length_dbns += dbns(&s0, &s1);
+
+            let penalty = penalty_map.penalty(&s1);
+            motion_cost_ecld += path_length_ecld + (path_length_ecld * penalty);
+            motion_cost_dbns += path_length_dbns + (path_length_dbns * penalty);
         }
 
         writer.serialize(&HumanResult {
             fa_flight_id: fa_flight_id.clone(),
             path_length_ecld,
             path_length_dbns,
+            motion_cost_ecld,
+            motion_cost_dbns,
         })?;
     }
 
